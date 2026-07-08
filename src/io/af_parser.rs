@@ -45,8 +45,8 @@ mod tests {
     fn test_read_af() -> std::io::Result<()> {
         let input_af = File::open("tests/jelia23-example.af")?;
         let af = read_af(input_af);
-        assert_eq!(af.get_arg_count(), 5);
-        assert_eq!(af.get_attack_count(), 8);
+        assert_eq!(af.argument_count(), 5);
+        assert_eq!(af.attack_count(), 8);
         Ok(())
         // assert_eq!(result, 4);
     }

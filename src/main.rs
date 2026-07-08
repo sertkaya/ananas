@@ -3,10 +3,10 @@ use clap::Parser;
 use std::fs::File;
 use execution_time::ExecutionTime;
 
-use crate::af_parser::read_af;
+mod af;
+mod af_parser;
 
-pub mod af;
-pub mod af_parser;
+use crate::af_parser::read_af;
 
 #[derive(Parser)]
 struct Params {
@@ -24,7 +24,7 @@ fn main()  -> std::io::Result<()> {
     let af = read_af(input_af);
     println!("Elapsed time: {}", timer.get_elapsed_time());
 
-    println!("{}", af.get_arg_count());
+    println!("{}", af.argument_count());
 
     Ok(())
 }

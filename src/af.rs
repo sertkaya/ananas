@@ -48,21 +48,31 @@ impl AF {
     }
 
     // Get the unmber of arguments
-    pub fn get_arg_count(&self) -> ArgType { self.arg_count }
+    pub fn argument_count(&self) -> ArgType { self.arg_count }
 
     // Get the number of attacks
-    pub fn get_attack_count(&self) ->usize  {
+    pub fn attack_count(&self) ->usize  {
         self.attacks.iter().map(|s| s.len()).sum()
     }
 
     // Get the victims of an argument
-    pub fn get_victims<'a>(&'a self, arg: ArgType) -> Iter<'a, ArgType> {
+    pub fn victims<'a>(&'a self, arg: ArgType) -> Iter<'a, ArgType> {
         self.attacks[arg as usize].iter()
     }
 
     // Get the attackers of an argument
-    pub fn get_attackers<'a>(&'a self, arg: ArgType) -> Iter<'a, ArgType> {
+    pub fn attackers<'a>(&'a self, arg: ArgType) -> Iter<'a, ArgType> {
         self.attacked_by[arg as usize].iter()
+    }
+
+    // Check if argument a attacks argument b
+    pub fn attacks(&self, a: ArgType, b: ArgType) -> bool {
+        self.attacks[a as usize].contains(&b)
+    }
+
+    // Check if argument a attacks any argument in the set s
+    pub fn attacks_set(&self, a: ArgType, s: &HashSet<ArgType>) -> bool {
+        !self.attacks[a as usize].is_disjoint(s)
     }
 }
 
@@ -78,14 +88,17 @@ mod tests {
         af.add_attack(1, 2);
         af.add_attack(3, 1);
 
-        assert_eq!(af.get_arg_count(), 10);
-        assert_eq!(af.get_attack_count(), 3);
+        assert_eq!(af.argument_count(), 10);
+        assert_eq!(af.attack_count(), 3);
 
         // assert_eq!(af.get_victims(1).collect()::<Vec<_>>, HashSet::from([2,3]));
         let mut res :HashSet<ArgType> = HashSet::new();
-        for v in af.get_victims(1) {
+        for v in af.victims(1) {
             res.insert(*v);
         }
-        assert_eq!(res, HashSet::from([2, 3]))
+        assert_eq!(res, HashSet::from([2, 3]));
+
+        assert_eq!(af.attacks(1, 2), true);
+        assert_eq!(af.attacks(2, 2), false)
     }
 }
