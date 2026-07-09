@@ -4,9 +4,9 @@ use std::fs::File;
 use execution_time::ExecutionTime;
 
 mod af;
-mod af_parser;
+mod io;
 
-use crate::af_parser::read_af;
+use crate::io::af_parser::read_af;
 
 #[derive(Parser)]
 struct Params {

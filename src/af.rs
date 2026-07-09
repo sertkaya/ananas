@@ -98,7 +98,17 @@ mod tests {
         }
         assert_eq!(res, HashSet::from([2, 3]));
 
+        let mut res :HashSet<ArgType> = HashSet::new();
+        for a in af.attackers(2) {
+            res.insert(*a);
+        }
+        assert_eq!(res, HashSet::from([1]));
+
         assert_eq!(af.attacks(1, 2), true);
-        assert_eq!(af.attacks(2, 2), false)
+        assert_eq!(af.attacks(2, 2), false);
+
+        assert_eq!(af.attacks_set(1, &HashSet::from([3, 4])), true);
+        assert_eq!(af.attacks_set(1, &HashSet::from([4, 5])), false);
+        assert_eq!(af.attacks_set(2, &HashSet::from([1])), false)
     }
 }
