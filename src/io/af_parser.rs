@@ -10,7 +10,7 @@ pub fn read_af(f: File) -> AF {
     let mut first_line = String::new();
     reader.read_line(&mut first_line).expect("Failed to read first line");
     let parts: Vec<&str> = first_line.split_whitespace().collect();
-    let arg_count:u32 = parts[2].parse().expect("Argument count is not a number");
+    let arg_count: usize = parts[2].parse().expect("Argument count is not a number");
 
     // Create an empty AF
     let mut af = AF::new(arg_count);
@@ -30,8 +30,8 @@ pub fn read_af(f: File) -> AF {
         if parts.len() != 2 {
             panic!("Syntax error in line {}", ln + 2);
         }
-        let attacker: u32 = parts[0].parse().expect("Attacker is not a number");
-        let victim: u32 = parts[1].parse().expect("Victim is not a number");
+        let attacker:  usize = parts[0].parse().expect("Attacker is not a number");
+        let victim:  usize = parts[1].parse().expect("Victim is not a number");
         af.add_attack(attacker - 1, victim - 1);
     }
     af
