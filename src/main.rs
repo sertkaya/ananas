@@ -1,9 +1,9 @@
-// use crate::af::AF;
 use clap::Parser;
 use std::fs::File;
 use execution_time::ExecutionTime;
 
 mod af;
+mod algorithms;
 mod io;
 
 use crate::io::af_parser::read_af;

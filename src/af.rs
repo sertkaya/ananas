@@ -2,8 +2,8 @@ use std::collections::hash_set::Iter;
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 
-// Argumentation framework represented as adjacency list.
-// Arguments are 32-bit unsigned integers.
+/// Argumentation framework represented as adjacency list.
+#[derive(Debug)]
 pub struct AF {
     // Number of arguments
     arg_count: usize,
@@ -30,14 +30,14 @@ impl Display for AF {
 }
 
 impl AF {
-    // Create a new argumentation framework with the given number of arguments
+    /// Create a new argumentation framework with the given number of arguments
     pub fn new(size: usize) -> AF {
         let attacks: Vec<HashSet<usize>> = vec![HashSet::new(); size];
         let attacked_by: Vec<HashSet<usize>> = vec![HashSet::new(); size];
         AF { arg_count: size, attacks, attacked_by }
     }
 
-    // Add an attack from the attacker to the victim
+    /// Add an attack from the attacker to the victim
     pub fn add_attack(&mut self, attacker: usize, victim: usize) {
         // add the attack to the attacks relation
         self.attacks[attacker].insert(victim);
@@ -45,35 +45,35 @@ impl AF {
         self.attacked_by[victim].insert(attacker);
     }
 
-    // Get the unmber of arguments
+    /// Get the number of arguments
     pub fn argument_count(&self) -> usize { self.arg_count }
 
-    // Get the number of attacks
+    /// Get the number of attacks
     pub fn attack_count(&self) ->usize  {
         self.attacks.iter().map(|s| s.len()).sum()
     }
 
-    // Get the victims of an argument
-    pub fn victims<'a>(&'a self, arg: usize) -> Iter<'a, usize> {
+    /// Get the victims of an argument
+    pub fn victims(&self, arg: usize) -> Iter<'_, usize> {
         self.attacks[arg].iter()
     }
 
-    // Get the number of attackers of an argument
+    /// Get the number of attackers of an argument
     pub fn attacker_count(&self, a: usize) -> usize {
         self.attacked_by[a].len()
     }
 
-    // Get the attackers of an argument
-    pub fn attackers<'a>(&'a self, arg: usize) -> Iter<'a, usize> {
+    /// Get the attackers of an argument
+    pub fn attackers(&self, arg: usize) -> Iter<'_, usize> {
         self.attacked_by[arg].iter()
     }
 
-    // Check if argument a attacks argument b
+    /// Check if argument a attacks argument b
     pub fn attacks(&self, a: usize, b: usize) -> bool {
         self.attacks[a].contains(&b)
     }
 
-    // Check if argument a attacks any argument in the set s
+    /// Check if argument a attacks any argument in the set s
     pub fn attacks_set(&self, a: usize, s: &HashSet<usize>) -> bool {
         !self.attacks[a].is_disjoint(s)
     }
@@ -107,11 +107,11 @@ mod tests {
         }
         assert_eq!(res, HashSet::from([1]));
 
-        assert_eq!(af.attacks(1, 2), true);
-        assert_eq!(af.attacks(2, 2), false);
+        assert!(af.attacks(1, 2));
+        assert!(!af.attacks(2, 2));
 
-        assert_eq!(af.attacks_set(1, &HashSet::from([3, 4])), true);
-        assert_eq!(af.attacks_set(1, &HashSet::from([4, 5])), false);
-        assert_eq!(af.attacks_set(2, &HashSet::from([1])), false)
+        assert!(af.attacks_set(1, &HashSet::from([3, 4])));
+        assert!(!af.attacks_set(1, &HashSet::from([4, 5])));
+        assert!(!af.attacks_set(2, &HashSet::from([1])))
     }
 }
