@@ -26,19 +26,27 @@ pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool
 
     while let Some(arg) = update.pop() {
         for &victim in af.victims(arg) {
+            // `victim` being defeated is a one-time fact: if another of its
+            // attackers already got accepted earlier and propagated this,
+            // doing it again would double-count `victim`'s defeat against
+            // its own victims' counts.
+            if node.defeat_propagated(victim) {
+                continue;
+            }
+            node.mark_defeat_propagated(victim);
+
             for &victim_of_victim in af.victims(victim) {
-                if node.is_prohibited(victim_of_victim) {
-                    continue;
-                }
+                // No is_prohibited guard here: defeat_propagated already
+                // ensures each real attacker of victim_of_victim contributes
+                // at most one decrement (deduplicated per attacker, not per
+                // target), so this can never be called more times than
+                // victim_of_victim's original attacker count -- including
+                // for forced/seeded arguments, whose count must keep being
+                // updated after they're already in the set.
                 if node.decrement_unattacked_attackers(victim_of_victim) == 0 {
                     if node.conflicts_with(af, victim_of_victim) {
                         return false;
                     }
-                    // Must stay here, right when the count hits 0: if this is
-                    // deferred until victim_of_victim is popped, a second
-                    // attacker of it defeated in this same sweep would
-                    // decrement it again below 0 before it's ever marked
-                    // prohibited.
                     node.add_argument(victim_of_victim);
                     update.push(victim_of_victim);
                 }
@@ -139,5 +147,27 @@ mod tests {
         let mut node = Node::new(&af);
 
         assert!(!pseudo_complete(vec![0], &mut node, &af));
+    }
+
+    // Regression test: 0 and 1 both attack 2 (attacker_count(2)=2); 2 and 4
+    // both attack 3 (attacker_count(3)=2); 4 self-attacks so it can never be
+    // defeated. 3 must stay excluded, since its attacker 4 is never defeated
+    // -- only 2 is. Without deduplicating "victim is defeated" per victim,
+    // 2's single defeat would get double-counted (once via 0, once via 1)
+    // and incorrectly satisfy both of 3's needed decrements.
+    #[test]
+    fn test_pseudo_complete_shared_intermediate() {
+        let mut af = AF::new(5);
+        af.add_attack(0, 2);
+        af.add_attack(1, 2);
+        af.add_attack(2, 3);
+        af.add_attack(4, 3);
+        af.add_attack(4, 4);
+        let mut node = Node::new(&af);
+
+        assert!(pseudo_complete(vec![0, 1], &mut node, &af));
+
+        println!("{}", node);
+        assert!(!node.contains(3), "3's attacker 4 was never defeated");
     }
 }

@@ -13,6 +13,9 @@ pub struct Node {
     // Whether an argument is prohibited from being added to node_args,
     // indexed by argument id
     prohibited: Vec<bool>,
+    // Whether an argument's defeat has already been propagated to its own
+    // victims' unattacked_attackers_count, indexed by argument id
+    defeat_propagated: Vec<bool>,
 }
 
 // Create a new node
@@ -24,7 +27,8 @@ impl Node {
             .map(|a| af.attacker_count(a))
             .collect();
         let prohibited = vec![false; af.argument_count()];
-        Node {node_args, unattacked_attackers_count, prohibited}
+        let defeat_propagated = vec![false; af.argument_count()];
+        Node {node_args, unattacked_attackers_count, prohibited, defeat_propagated}
     }
 
     /// Add an argument to this node's set of arguments
@@ -65,6 +69,19 @@ impl Node {
     /// node's set
     pub fn is_defeated(&self, af: &AF, arg: usize) -> bool {
         af.attackers(arg).any(|&a| self.contains(a))
+    }
+
+    /// Check whether `arg`'s defeat has already been propagated to its own
+    /// victims' unattacked_attackers_count. `arg` being defeated is a
+    /// one-time fact regardless of how many of its attackers are accepted,
+    /// so this must only ever happen once.
+    pub fn defeat_propagated(&self, arg: usize) -> bool {
+        self.defeat_propagated[arg]
+    }
+
+    /// Mark `arg`'s defeat as having been propagated
+    pub fn mark_defeat_propagated(&mut self, arg: usize) {
+        self.defeat_propagated[arg] = true;
     }
 
     /// Check whether `arg` conflicts with this node's set of arguments,
