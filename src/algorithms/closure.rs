@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use crate::af::AF;
 use crate::algorithms::node::Node;
 
@@ -6,19 +7,27 @@ use crate::algorithms::node::Node;
 /// defeated by `node`'s current arguments is itself added to `node`.
 /// `update` is a stack of arguments to add to `node` and whose effect on the
 /// unattacked-attacker counts of their attacked arguments' victims still
-/// needs to be propagated.
+/// needs to be propagated. `prohibited_candidates` are arguments already
+/// known to be unsuitable (e.g. previously-failed search candidates in this
+/// branch); the closure must not be forced to include any of them.
 ///
 /// Returns `false` as soon as an argument that would be added conflicts with
-/// `node`'s current set (in either attack direction, including self-attack),
-/// leaving `node` in a discarded, no-longer-meaningful state. Returns `true`
-/// if the closure completed without any conflict.
+/// `node`'s current set (in either attack direction, including self-attack)
+/// or is in `prohibited_candidates`, leaving `node` in a discarded,
+/// no-longer-meaningful state. Returns `true` if the closure completed
+/// without any conflict.
 #[must_use]
-pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool {
+pub fn pseudo_complete(
+    mut update: Vec<usize>,
+    node: &mut Node,
+    af: &AF,
+    prohibited_candidates: &HashSet<usize>,
+) -> bool {
     // Mark the seed arguments as added up front, before any propagation, so
     // that a seed sitting deeper on the stack is already prohibited if some
     // other seed's propagation happens to target it first.
     for &arg in &update {
-        if node.conflicts_with(af, arg) {
+        if node.conflicts_with(af, arg) || prohibited_candidates.contains(&arg) {
             return false;
         }
         node.add_argument(arg);
@@ -44,7 +53,9 @@ pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool
                 // for forced/seeded arguments, whose count must keep being
                 // updated after they're already in the set.
                 if node.decrement_unattacked_attackers(victim_of_victim) == 0 {
-                    if node.conflicts_with(af, victim_of_victim) {
+                    if node.conflicts_with(af, victim_of_victim)
+                        || prohibited_candidates.contains(&victim_of_victim)
+                    {
                         return false;
                     }
                     node.add_argument(victim_of_victim);
@@ -76,7 +87,7 @@ mod tests {
         let af = build_af();
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
 
         assert!(node.contains(0));
         assert!(!node.contains(1));
@@ -103,7 +114,7 @@ mod tests {
             }
         }
 
-        assert!(pseudo_complete(update, &mut node, &af));
+        assert!(pseudo_complete(update, &mut node, &af, &HashSet::new()));
 
         for arg in 0..af.argument_count() {
             assert!(!node.contains(arg));
@@ -123,7 +134,7 @@ mod tests {
         let af = read_af(input_af);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
 
         assert!(node.contains(0));
         assert!(!node.contains(1));
@@ -146,7 +157,7 @@ mod tests {
         af.add_attack(2, 0);
         let mut node = Node::new(&af);
 
-        assert!(!pseudo_complete(vec![0], &mut node, &af));
+        assert!(!pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
     }
 
     // Regression test: 0 and 1 both attack 2 (attacker_count(2)=2); 2 and 4
@@ -165,9 +176,23 @@ mod tests {
         af.add_attack(4, 4);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0, 1], &mut node, &af));
+        assert!(pseudo_complete(vec![0, 1], &mut node, &af, &HashSet::new()));
 
         println!("{}", node);
         assert!(!node.contains(3), "3's attacker 4 was never defeated");
+    }
+
+    // 0 -> 1 -> 2: forcing 0 in organically pulls in 2 (via 1's defeat), with
+    // no direct conflict. If 2 is already a known-prohibited candidate (e.g.
+    // a previously-failed search hypothesis), the closure must still reject
+    // it, even though nothing here would trip conflicts_with on its own.
+    #[test]
+    fn test_pseudo_complete_prohibited_candidate() {
+        let mut af = AF::new(3);
+        af.add_attack(0, 1);
+        af.add_attack(1, 2);
+        let mut node = Node::new(&af);
+
+        assert!(!pseudo_complete(vec![0], &mut node, &af, &HashSet::from([2])));
     }
 }

@@ -4,20 +4,30 @@ use crate::algorithms::closure::pseudo_complete;
 use crate::algorithms::node::Node;
 
 /// A node of the search tree paired with the candidate arguments still to
-/// be tried, lazily, for defeating its most constrained undefeated attacker.
+/// be tried, lazily, for defeating its most constrained undefeated attacker,
+/// and the arguments already known (from earlier failed candidates tried at
+/// or above this point) to be unsuitable for this branch.
 struct Frame {
     node: Node,
     candidates: Vec<usize>,
+    prohibited_candidates: HashSet<usize>,
+    // The candidate whose subtree we just pushed on top of this frame, if
+    // any. If this frame is popped again while this is set, that subtree
+    // must have failed entirely without success (a success would have
+    // returned from the whole search already), so the candidate belongs in
+    // prohibited_candidates before we try anything else from this frame.
+    pending_candidate: Option<usize>,
 }
 
 /// Among `node`'s undefended members' undefeated attackers, find the one
-/// with the fewest non-prohibited attackers of its own -- the most
-/// constrained argument to defeat -- and return its non-prohibited
-/// attackers as the candidates to try defeating it with.
+/// with the fewest attackers of its own that are neither already decided
+/// nor in `prohibited_candidates` -- the most constrained argument to
+/// defeat -- and return those attackers as the candidates to try defeating
+/// it with.
 ///
 /// `node` must not be self-defending, i.e. some member must have an
 /// undefeated attacker.
-fn candidates(node: &Node, af: &AF) -> Vec<usize> {
+fn candidates(node: &Node, af: &AF, prohibited_candidates: &HashSet<usize>) -> Vec<usize> {
     let mut best_attacker: Option<usize> = None;
     let mut best_count = usize::MAX;
     for m in 0..af.argument_count() {
@@ -28,7 +38,9 @@ fn candidates(node: &Node, af: &AF) -> Vec<usize> {
             if node.is_defeated(af, b) {
                 continue;
             }
-            let count = af.attackers(b).filter(|&&c| !node.is_prohibited(c)).count();
+            let count = af.attackers(b)
+                .filter(|&&c| !node.is_prohibited(c) && !prohibited_candidates.contains(&c))
+                .count();
             if count < best_count {
                 best_count = count;
                 best_attacker = Some(b);
@@ -39,7 +51,10 @@ fn candidates(node: &Node, af: &AF) -> Vec<usize> {
     let b = best_attacker
         .expect("a non-self-defending node must have an undefeated attacker");
 
-    af.attackers(b).filter(|&c| !node.is_prohibited(*c)).copied().collect()
+    af.attackers(b)
+        .filter(|&c| !node.is_prohibited(*c) && !prohibited_candidates.contains(c))
+        .copied()
+        .collect()
 }
 
 /// Decide DC-CO: is `arg` credulously accepted with respect to the complete
@@ -58,7 +73,7 @@ pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
         }
     }
 
-    if !pseudo_complete(update, &mut current_node, af) {
+    if !pseudo_complete(update, &mut current_node, af, &HashSet::new()) {
         // The hypothesis that `arg` is in the extension is already
         // contradictory: closing it produced a conflict.
         return None;
@@ -71,10 +86,26 @@ pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
         return Some(current_node.arguments());
     }
 
-    let root_candidates = candidates(&current_node, af);
-    let mut stack: Vec<Frame> = vec![Frame { node: current_node, candidates: root_candidates }];
+    // No candidate has been tried yet, so nothing is prohibited beyond what
+    // conflicts_with already rejects dynamically.
+    let prohibited_candidates = HashSet::new();
+    let root_candidates = candidates(&current_node, af, &prohibited_candidates);
+    let mut stack: Vec<Frame> = vec![Frame {
+        node: current_node,
+        candidates: root_candidates,
+        prohibited_candidates,
+        pending_candidate: None,
+    }];
 
     while let Some(mut frame) = stack.pop() {
+        // If set, the candidate's whole subtree just failed (see
+        // pending_candidate's doc comment): it must never be retried in
+        // this branch, even as a side effect of a different candidate's
+        // closure.
+        if let Some(failed) = frame.pending_candidate.take() {
+            frame.prohibited_candidates.insert(failed);
+        }
+
         // Take just one untried candidate; leave the rest for later, so a
         // sibling is only ever generated once this candidate's whole
         // subtree has been fully explored and abandoned.
@@ -83,16 +114,25 @@ pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
         };
 
         let mut child = frame.node.clone();
-        if !frame.candidates.is_empty() {
-            stack.push(frame);
-        }
+        let child_prohibited_candidates = frame.prohibited_candidates.clone();
 
-        if pseudo_complete(vec![c], &mut child, af) {
+        // Push this frame back before trying c, regardless of outcome: if c
+        // fails immediately, we'll pop it again right away; if it needs a
+        // subtree, that gets pushed on top of it next.
+        frame.pending_candidate = Some(c);
+        stack.push(frame);
+
+        if pseudo_complete(vec![c], &mut child, af, &child_prohibited_candidates) {
             if child.is_self_defending() {
                 return Some(child.arguments());
             }
-            let child_candidates = candidates(&child, af);
-            stack.push(Frame { node: child, candidates: child_candidates });
+            let child_candidates = candidates(&child, af, &child_prohibited_candidates);
+            stack.push(Frame {
+                node: child,
+                candidates: child_candidates,
+                prohibited_candidates: child_prohibited_candidates,
+                pending_candidate: None,
+            });
         }
     }
 
@@ -138,5 +178,22 @@ mod tests {
         assert!(extension.contains(&0));
         assert!(extension.contains(&2) || extension.contains(&3));
         assert!(!(extension.contains(&2) && extension.contains(&3)));
+    }
+
+    #[test]
+    fn test_candidates_excludes_prohibited() {
+        // 0 attacks the target 1's... wait, 1 attacks 0; both 2 and 3 attack
+        // 1. If 3 is already known-prohibited (e.g. a previously-failed
+        // candidate elsewhere in this branch), it must not be offered again
+        // as a candidate to defeat 1.
+        let mut af = AF::new(4);
+        af.add_attack(1, 0);
+        af.add_attack(2, 1);
+        af.add_attack(3, 1);
+        let mut node = Node::new(&af);
+        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+
+        let prohibited = HashSet::from([3]);
+        assert_eq!(candidates(&node, &af, &prohibited), vec![2]);
     }
 }
