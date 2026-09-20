@@ -1,3 +1,3 @@
 mod closure;
-mod complete;
+pub mod complete;
 mod node;
