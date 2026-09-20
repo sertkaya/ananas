@@ -23,7 +23,14 @@ struct Frame {
 /// with the fewest attackers of its own that are neither already decided
 /// nor in `prohibited_candidates` -- the most constrained argument to
 /// defeat -- and return those attackers as the candidates to try defeating
-/// it with.
+/// it with, ordered so that the candidate with the fewest attackers of its
+/// own (hence the least likely to trigger further branching) is tried
+/// first, with ties broken by argument id. Both the search over undefeated
+/// attackers and this ordering are made fully deterministic on purpose:
+/// af.attackers()/af.victims() iterate a HashSet, whose order depends on
+/// Rust's per-process randomized hash seed, so leaving either choice to
+/// that order would make the amount of search work done for the exact same
+/// query vary randomly from run to run.
 ///
 /// `node` must not be self-defending, i.e. some member must have an
 /// undefeated attacker.
@@ -41,7 +48,11 @@ fn candidates(node: &Node, af: &AF, prohibited_candidates: &HashSet<usize>) -> V
             let count = af.attackers(b)
                 .filter(|&&c| !node.is_prohibited(c) && !prohibited_candidates.contains(&c))
                 .count();
-            if count < best_count {
+            let better = match best_attacker {
+                None => true,
+                Some(current) => count < best_count || (count == best_count && b < current),
+            };
+            if better {
                 best_count = count;
                 best_attacker = Some(b);
             }
@@ -51,10 +62,35 @@ fn candidates(node: &Node, af: &AF, prohibited_candidates: &HashSet<usize>) -> V
     let b = best_attacker
         .expect("a non-self-defending node must have an undefeated attacker");
 
-    af.attackers(b)
+    let mut result: Vec<usize> = af.attackers(b)
         .filter(|&c| !node.is_prohibited(*c) && !prohibited_candidates.contains(c))
         .copied()
-        .collect()
+        .collect();
+    result.sort_by_key(|&c| (af.attacker_count(c), c));
+    result.reverse();
+    result
+}
+
+/// Format the diagnostic counters tracked by `dc_co` for a `verbose` print.
+fn format_stats(
+    nodes_visited: usize,
+    pseudo_complete_calls: usize,
+    frames_created: usize,
+    candidate_count_sum: usize,
+    candidate_count_min: usize,
+    candidate_count_max: usize,
+) -> String {
+    let avg = if frames_created > 0 {
+        candidate_count_sum as f64 / frames_created as f64
+    } else {
+        0.0
+    };
+    let min = if frames_created > 0 { candidate_count_min } else { 0 };
+    format!(
+        "nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls} \
+         frames_created={frames_created} candidates_avg={avg:.2} \
+         candidates_min={min} candidates_max={candidate_count_max}"
+    )
 }
 
 /// Decide DC-CO: is `arg` credulously accepted with respect to the complete
@@ -65,6 +101,14 @@ fn candidates(node: &Node, af: &AF, prohibited_candidates: &HashSet<usize>) -> V
 pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     let mut nodes_visited: usize = 0;
     let mut pseudo_complete_calls: usize = 0;
+    // Distribution of candidates.len() at every frame creation (root and
+    // children), to see whether difficulty comes from many nodes each
+    // having a handful of candidates, or a few nodes with huge candidate
+    // lists.
+    let mut frames_created: usize = 0;
+    let mut candidate_count_sum: usize = 0;
+    let mut candidate_count_max: usize = 0;
+    let mut candidate_count_min: usize = usize::MAX;
 
     let mut current_node = Node::new(af);
 
@@ -83,7 +127,17 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // The hypothesis that `arg` is in the extension is already
         // contradictory: closing it produced a conflict.
         if verbose {
-            eprintln!("[dc_co stats] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls}");
+            eprintln!(
+                "[dc_co stats] {}",
+                format_stats(
+                    nodes_visited,
+                    pseudo_complete_calls,
+                    frames_created,
+                    candidate_count_sum,
+                    candidate_count_min,
+                    candidate_count_max
+                )
+            );
         }
         return None;
     }
@@ -93,7 +147,17 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // defense (guaranteed by pseudo_complete), and now every argument
         // in it defends itself: that's exactly a complete extension.
         if verbose {
-            eprintln!("[dc_co stats] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls}");
+            eprintln!(
+                "[dc_co stats] {}",
+                format_stats(
+                    nodes_visited,
+                    pseudo_complete_calls,
+                    frames_created,
+                    candidate_count_sum,
+                    candidate_count_min,
+                    candidate_count_max
+                )
+            );
         }
         return Some(current_node.arguments());
     }
@@ -102,6 +166,10 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     // conflicts_with already rejects dynamically.
     let prohibited_candidates = HashSet::new();
     let root_candidates = candidates(&current_node, af, &prohibited_candidates);
+    frames_created += 1;
+    candidate_count_sum += root_candidates.len();
+    candidate_count_max = candidate_count_max.max(root_candidates.len());
+    candidate_count_min = candidate_count_min.min(root_candidates.len());
     let mut stack: Vec<Frame> = vec![Frame {
         node: current_node,
         candidates: root_candidates,
@@ -113,7 +181,15 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         nodes_visited += 1;
         if verbose && nodes_visited % 1000 == 0 {
             eprintln!(
-                "[dc_co progress] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls} stack_len={}",
+                "[dc_co progress] {} stack_len={}",
+                format_stats(
+                    nodes_visited,
+                    pseudo_complete_calls,
+                    frames_created,
+                    candidate_count_sum,
+                    candidate_count_min,
+                    candidate_count_max
+                ),
                 stack.len()
             );
         }
@@ -146,11 +222,25 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         if pseudo_complete(vec![c], &mut child, af, &child_prohibited_candidates) {
             if child.is_self_defending() {
                 if verbose {
-                    eprintln!("[dc_co stats] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls}");
+                    eprintln!(
+                "[dc_co stats] {}",
+                format_stats(
+                    nodes_visited,
+                    pseudo_complete_calls,
+                    frames_created,
+                    candidate_count_sum,
+                    candidate_count_min,
+                    candidate_count_max
+                )
+            );
                 }
                 return Some(child.arguments());
             }
             let child_candidates = candidates(&child, af, &child_prohibited_candidates);
+            frames_created += 1;
+            candidate_count_sum += child_candidates.len();
+            candidate_count_max = candidate_count_max.max(child_candidates.len());
+            candidate_count_min = candidate_count_min.min(child_candidates.len());
             stack.push(Frame {
                 node: child,
                 candidates: child_candidates,
@@ -161,7 +251,17 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     }
 
     if verbose {
-        eprintln!("[dc_co stats] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls}");
+        eprintln!(
+            "[dc_co stats] {}",
+            format_stats(
+                nodes_visited,
+                pseudo_complete_calls,
+                frames_created,
+                candidate_count_sum,
+                candidate_count_min,
+                candidate_count_max
+            )
+        );
     }
     None
 }
