@@ -16,6 +16,14 @@ pub struct Node {
     // Whether an argument's defeat has already been propagated to its own
     // victims' unattacked_attackers_count, indexed by argument id
     defeat_propagated: Vec<bool>,
+    // Number of attackers of each argument not yet confirmed to also attack
+    // this node's set (quasi-complete: reaching 0 means every attacker of
+    // the argument attacks the set too, regardless of whether the argument
+    // itself is defended)
+    unconfirmed_attackers_count: Vec<usize>,
+    // Whether an argument's status as an attacker of this node's set has
+    // already been propagated to its own victims' unconfirmed_attackers_count
+    attacks_set_propagated: Vec<bool>,
 }
 
 // Create a new node
@@ -28,7 +36,18 @@ impl Node {
             .collect();
         let prohibited = vec![false; af.argument_count()];
         let defeat_propagated = vec![false; af.argument_count()];
-        Node {node_args, unattacked_attackers_count, prohibited, defeat_propagated}
+        let unconfirmed_attackers_count = (0..af.argument_count())
+            .map(|a| af.attacker_count(a))
+            .collect();
+        let attacks_set_propagated = vec![false; af.argument_count()];
+        Node {
+            node_args,
+            unattacked_attackers_count,
+            prohibited,
+            defeat_propagated,
+            unconfirmed_attackers_count,
+            attacks_set_propagated,
+        }
     }
 
     /// Add an argument to this node's set of arguments
@@ -82,6 +101,33 @@ impl Node {
     /// Mark `arg`'s defeat as having been propagated
     pub fn mark_defeat_propagated(&mut self, arg: usize) {
         self.defeat_propagated[arg] = true;
+    }
+
+    /// Get the number of `arg`'s attackers not yet confirmed to also attack
+    /// this node's set
+    pub fn unconfirmed_attackers_count(&self, arg: usize) -> usize {
+        self.unconfirmed_attackers_count[arg]
+    }
+
+    /// Decrement the number of `arg`'s attackers not yet confirmed to also
+    /// attack this node's set, and return the new count
+    pub fn decrement_unconfirmed_attackers(&mut self, arg: usize) -> usize {
+        self.unconfirmed_attackers_count[arg] -= 1;
+        self.unconfirmed_attackers_count[arg]
+    }
+
+    /// Check whether `arg`'s status as an attacker of this node's set has
+    /// already been propagated to its own victims. `arg` attacking the set
+    /// is a one-time fact regardless of how many members of the set it
+    /// attacks, so this must only ever happen once.
+    pub fn attacks_set_propagated(&self, arg: usize) -> bool {
+        self.attacks_set_propagated[arg]
+    }
+
+    /// Mark `arg`'s status as an attacker of this node's set as having been
+    /// propagated
+    pub fn mark_attacks_set_propagated(&mut self, arg: usize) {
+        self.attacks_set_propagated[arg] = true;
     }
 
     /// Check whether `arg` conflicts with this node's set of arguments,

@@ -2,14 +2,18 @@ use std::collections::HashSet;
 use crate::af::AF;
 use crate::algorithms::node::Node;
 
-/// Extend `node` with the deterministic closure of the "defense" property of
-/// complete extensions: an argument all of whose attackers have already been
-/// defeated by `node`'s current arguments is itself added to `node`.
-/// `update` is a stack of arguments to add to `node` and whose effect on the
-/// unattacked-attacker counts of their attacked arguments' victims still
-/// needs to be propagated. `prohibited_candidates` are arguments already
-/// known to be unsuitable (e.g. previously-failed search candidates in this
-/// branch); the closure must not be forced to include any of them.
+/// Extend `node` with its smallest pseudo-complete superset: repeatedly
+/// apply the semi-complete rule (an argument all of whose attackers have
+/// already been defeated by `node`'s current arguments is itself added) and
+/// the quasi-complete rule (an argument all of whose attackers also attack
+/// `node`'s current arguments is itself added, whether or not it is
+/// defended) until neither can add anything more.
+/// `update` is a stack of arguments to add to `node` and whose effect on
+/// their attacked arguments' victims (semi-complete) and their attackers'
+/// other victims (quasi-complete) still needs to be propagated.
+/// `prohibited_candidates` are arguments already known to be unsuitable
+/// (e.g. previously-failed search candidates in this branch); the closure
+/// must not be forced to include any of them.
 ///
 /// Returns `false` as soon as an argument that would be added conflicts with
 /// `node`'s current set (in either attack direction, including self-attack)
@@ -60,6 +64,30 @@ pub fn pseudo_complete(
                     }
                     node.add_argument(victim_of_victim);
                     update.push(victim_of_victim);
+                }
+            }
+        }
+
+        for &attacker in af.attackers(arg) {
+            // `attacker` being confirmed to attack `node`'s set is a
+            // one-time fact: if it was already confirmed via a different
+            // member of the set, doing it again would double-count it
+            // against its other victims' counts. Same reasoning as
+            // defeat_propagated above, mirrored for the quasi-complete rule.
+            if node.attacks_set_propagated(attacker) {
+                continue;
+            }
+            node.mark_attacks_set_propagated(attacker);
+
+            for &co_victim in af.victims(attacker) {
+                if node.decrement_unconfirmed_attackers(co_victim) == 0 {
+                    if node.conflicts_with(af, co_victim)
+                        || prohibited_candidates.contains(&co_victim)
+                    {
+                        return false;
+                    }
+                    node.add_argument(co_victim);
+                    update.push(co_victim);
                 }
             }
         }
@@ -194,5 +222,29 @@ mod tests {
         let mut node = Node::new(&af);
 
         assert!(!pseudo_complete(vec![0], &mut node, &af, &HashSet::from([2])));
+    }
+
+    // Quasi-complete rule in isolation: 0 -> 1 -> 2 means forcing 0 in
+    // defeats 1, defending 2 (semi-complete). Separately, 3 -> 0 makes 3 an
+    // attacker of the set from the start, and 3 -> 4 means 4's only
+    // attacker (3) also attacks the set -- so 4 must be added too, even
+    // though 3 itself is never defeated and 4 is therefore not defended.
+    #[test]
+    fn test_pseudo_complete_quasi_complete() {
+        let mut af = AF::new(5);
+        af.add_attack(0, 1);
+        af.add_attack(1, 2);
+        af.add_attack(3, 0);
+        af.add_attack(3, 4);
+        let mut node = Node::new(&af);
+
+        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+
+        println!("{}", node);
+        assert!(node.contains(2), "2 is defended once 0 defeats its attacker 1");
+        assert!(
+            node.contains(4),
+            "4's only attacker (3) also attacks the set, so quasi-complete must add it"
+        );
     }
 }
