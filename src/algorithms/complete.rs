@@ -59,8 +59,13 @@ fn candidates(node: &Node, af: &AF, prohibited_candidates: &HashSet<usize>) -> V
 
 /// Decide DC-CO: is `arg` credulously accepted with respect to the complete
 /// semantics? Returns the complete extension of `af` containing `arg` if one
-/// exists, `None` otherwise.
-pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
+/// exists, `None` otherwise. If `verbose`, prints search-tree size
+/// diagnostics (nodes visited, pseudo_complete calls) to stderr as it runs
+/// -- useful for investigating slow instances.
+pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
+    let mut nodes_visited: usize = 0;
+    let mut pseudo_complete_calls: usize = 0;
+
     let mut current_node = Node::new(af);
 
     // We hypothesize that `arg` is in the extension, and arguments with no
@@ -73,9 +78,13 @@ pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
         }
     }
 
+    pseudo_complete_calls += 1;
     if !pseudo_complete(update, &mut current_node, af, &HashSet::new()) {
         // The hypothesis that `arg` is in the extension is already
         // contradictory: closing it produced a conflict.
+        if verbose {
+            eprintln!("[dc_co stats] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls}");
+        }
         return None;
     }
 
@@ -83,6 +92,9 @@ pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
         // node_args is conflict-free (checked above) and closed under
         // defense (guaranteed by pseudo_complete), and now every argument
         // in it defends itself: that's exactly a complete extension.
+        if verbose {
+            eprintln!("[dc_co stats] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls}");
+        }
         return Some(current_node.arguments());
     }
 
@@ -98,6 +110,14 @@ pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
     }];
 
     while let Some(mut frame) = stack.pop() {
+        nodes_visited += 1;
+        if verbose && nodes_visited % 1000 == 0 {
+            eprintln!(
+                "[dc_co progress] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls} stack_len={}",
+                stack.len()
+            );
+        }
+
         // If set, the candidate's whole subtree just failed (see
         // pending_candidate's doc comment): it must never be retried in
         // this branch, even as a side effect of a different candidate's
@@ -122,8 +142,12 @@ pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
         frame.pending_candidate = Some(c);
         stack.push(frame);
 
+        pseudo_complete_calls += 1;
         if pseudo_complete(vec![c], &mut child, af, &child_prohibited_candidates) {
             if child.is_self_defending() {
+                if verbose {
+                    eprintln!("[dc_co stats] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls}");
+                }
                 return Some(child.arguments());
             }
             let child_candidates = candidates(&child, af, &child_prohibited_candidates);
@@ -136,6 +160,9 @@ pub fn dc_co(af: &AF, arg: usize) -> Option<HashSet<usize>> {
         }
     }
 
+    if verbose {
+        eprintln!("[dc_co stats] nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls}");
+    }
     None
 }
 
@@ -148,7 +175,7 @@ mod tests {
         // 0 has no attackers, so it's unconditionally in -- resolved at the
         // root, no search needed.
         let af = AF::new(1);
-        let extension = dc_co(&af, 0).expect("0 has no attackers, must be accepted");
+        let extension = dc_co(&af, 0, false).expect("0 has no attackers, must be accepted");
         assert!(extension.contains(&0));
     }
 
@@ -159,7 +186,7 @@ mod tests {
         af.add_attack(0, 1);
         af.add_attack(1, 2);
         af.add_attack(2, 0);
-        assert!(dc_co(&af, 0).is_none());
+        assert!(dc_co(&af, 0, false).is_none());
     }
 
     #[test]
@@ -174,7 +201,7 @@ mod tests {
         af.add_attack(2, 3);
         af.add_attack(3, 2);
 
-        let extension = dc_co(&af, 0).expect("1 can be defeated by either 2 or 3");
+        let extension = dc_co(&af, 0, false).expect("1 can be defeated by either 2 or 3");
         assert!(extension.contains(&0));
         assert!(extension.contains(&2) || extension.contains(&3));
         assert!(!(extension.contains(&2) && extension.contains(&3)));

@@ -38,6 +38,11 @@ struct Params {
         required_if_eq("problem", "DC-ST")
     )]
     argument: Option<usize>,
+
+    /// Print search-tree size diagnostics (nodes visited, pseudo_complete
+    /// calls) to stderr as the solver runs
+    #[arg(short = 'v', long = "verbose")]
+    verbose: bool,
 }
 
 fn main() -> std::io::Result<()> {
@@ -47,7 +52,7 @@ fn main() -> std::io::Result<()> {
     // Start the timer
     let timer = ExecutionTime::start();
     let af = read_af(input_af);
-    println!("Elapsed time: {}", timer.get_elapsed_time());
+    println!("Parsing time: {}", timer.get_elapsed_time());
 
     match params.problem {
         Problem::DcCo => {
@@ -55,7 +60,10 @@ fn main() -> std::io::Result<()> {
             if arg == 0 {
                 panic!("Argument id must be >= 1");
             }
-            match dc_co(&af, arg - 1) {
+            let solve_timer = ExecutionTime::start();
+            let result = dc_co(&af, arg - 1, params.verbose);
+            println!("Solving time: {}", solve_timer.get_elapsed_time());
+            match result {
                 Some(extension) => {
                     let mut extension: Vec<usize> = extension.into_iter().map(|a| a + 1).collect();
                     extension.sort_unstable();
