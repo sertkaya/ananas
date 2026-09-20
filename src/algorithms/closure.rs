@@ -38,6 +38,7 @@ pub fn pseudo_complete(
     }
 
     while let Some(arg) = update.pop() {
+        // --- begin: semi-complete closure ---
         for &victim in af.victims(arg) {
             // `victim` being defeated is a one-time fact: if another of its
             // attackers already got accepted earlier and propagated this,
@@ -67,7 +68,9 @@ pub fn pseudo_complete(
                 }
             }
         }
+        // --- end: semi-complete closure ---
 
+        // --- begin: quasi-complete closure ---
         for &attacker in af.attackers(arg) {
             // `attacker` being confirmed to attack `node`'s set is a
             // one-time fact: if it was already confirmed via a different
@@ -78,6 +81,29 @@ pub fn pseudo_complete(
                 continue;
             }
             node.mark_attacks_set_propagated(attacker);
+
+            // --- begin: single-attacker (P-pseudo-complete) optimization ---
+            // Section 4.2 of the paper: if `attacker` is an undefeated
+            // attacker of the set with exactly one remaining possible
+            // defender, that defender is forced -- there's no alternative
+            // to branch on, so add it right here instead of waiting for
+            // the search to discover and try it as a single-candidate
+            // branch.
+            if !node.is_defeated(af, attacker) {
+                let remaining: Vec<usize> = af.attackers(attacker)
+                    .filter(|&&b| {
+                        !node.is_prohibited(b)
+                            && !prohibited_candidates.contains(&b)
+                            && !node.conflicts_with(af, b)
+                    })
+                    .copied()
+                    .collect();
+                if remaining.len() == 1 {
+                    node.add_argument(remaining[0]);
+                    update.push(remaining[0]);
+                }
+            }
+            // --- end: single-attacker (P-pseudo-complete) optimization ---
 
             for &co_victim in af.victims(attacker) {
                 if node.decrement_unconfirmed_attackers(co_victim) == 0 {
@@ -91,6 +117,7 @@ pub fn pseudo_complete(
                 }
             }
         }
+        // --- end: quasi-complete closure ---
     }
     true
 }
@@ -246,5 +273,28 @@ mod tests {
             node.contains(4),
             "4's only attacker (3) also attacks the set, so quasi-complete must add it"
         );
+    }
+
+    // Single-defender chain (paper Section 4.2 / Figure 3): forcing 0 in
+    // leaves its attacker 1 undefeated; 1's only possible defender is 2, so
+    // 2 must be forced in too, with no branching. That in turn leaves 2's
+    // attacker 3 undefeated; 3's only possible defender is 4, so 4 gets
+    // forced in as well -- a two-link forced chain resolved within this one
+    // pseudo_complete call, yielding a complete extension directly.
+    #[test]
+    fn test_pseudo_complete_single_defender_chain() {
+        let mut af = AF::new(5);
+        af.add_attack(1, 0);
+        af.add_attack(2, 1);
+        af.add_attack(3, 2);
+        af.add_attack(4, 3);
+        let mut node = Node::new(&af);
+
+        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+
+        println!("{}", node);
+        assert!(node.contains(2), "2 is 1's only possible defender");
+        assert!(node.contains(4), "4 is 3's only possible defender");
+        assert!(node.is_self_defending());
     }
 }
