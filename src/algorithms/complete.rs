@@ -179,7 +179,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
 
     while let Some(mut frame) = stack.pop() {
         nodes_visited += 1;
-        if verbose && nodes_visited % 1000 == 0 {
+        if verbose && nodes_visited.is_multiple_of(1000) {
             eprintln!(
                 "[dc_co progress] {} stack_len={}",
                 format_stats(
