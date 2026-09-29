@@ -125,6 +125,15 @@ pub fn pseudo_complete(
                     })
                     .copied()
                     .collect();
+                if remaining.is_empty() {
+                    // `attacker` attacks the set, nothing in the set
+                    // defeats it, and every one of its own attackers is
+                    // prohibited or conflicts with the set. The set can
+                    // never be defended against it, so this branch is
+                    // already dead. Saying so here saves the search a
+                    // candidate scan that could only return an empty list.
+                    return false;
+                }
                 if remaining.len() == 1 {
                     node.add_argument(remaining[0]);
                     update.push(remaining[0]);
@@ -283,13 +292,23 @@ mod tests {
     // attacker of the set from the start, and 3 -> 4 means 4's only
     // attacker (3) also attacks the set -- so 4 must be added too, even
     // though 3 itself is never defeated and 4 is therefore not defended.
+    //
+    // 5 and 6 attack 3 and each other. They keep 3 from being unattacked --
+    // an unattacked attacker of the set could never be defeated, so the
+    // branch would be dead and there would be no pseudo-complete superset
+    // at all -- while leaving 3 two possible defenders, so neither the
+    // single-defender rule nor the no-defender check resolves it first.
     #[test]
     fn test_pseudo_complete_quasi_complete() {
-        let mut af = AF::new(5);
+        let mut af = AF::new(7);
         af.add_attack(0, 1);
         af.add_attack(1, 2);
         af.add_attack(3, 0);
         af.add_attack(3, 4);
+        af.add_attack(5, 3);
+        af.add_attack(6, 3);
+        af.add_attack(5, 6);
+        af.add_attack(6, 5);
         let mut node = Node::new(&af);
 
         assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
@@ -300,6 +319,22 @@ mod tests {
             node.contains(4),
             "4's only attacker (3) also attacks the set, so quasi-complete must add it"
         );
+    }
+
+    // No-defender check: 1 attacks the target 0, and 1's only attacker 2 is
+    // itself attacked by 0, so 2 conflicts with the set and can never be
+    // added. Nothing else can defeat 1, so the set can never be defended
+    // against it and the branch is dead -- pseudo_complete must say so
+    // rather than leave the search to discover an empty candidate list.
+    #[test]
+    fn test_pseudo_complete_no_possible_defender() {
+        let mut af = AF::new(3);
+        af.add_attack(1, 0);
+        af.add_attack(2, 1);
+        af.add_attack(0, 2);
+        let mut node = Node::new(&af);
+
+        assert!(!pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
     }
 
     // Mixed defeat routes: 3's two attackers are each known defeated by a

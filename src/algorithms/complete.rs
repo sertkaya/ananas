@@ -20,10 +20,23 @@ struct Frame {
 }
 
 /// Among `node`'s undefended members' undefeated attackers, find the one
-/// with the fewest attackers of its own that are neither already decided
-/// nor in `prohibited_candidates` -- the most constrained argument to
-/// defeat -- and return those attackers as the candidates to try defeating
-/// it with, ordered so that the candidate with the fewest attackers of its
+/// with the fewest usable attackers of its own -- the most constrained
+/// argument to defeat -- and return those attackers as the candidates to
+/// try defeating it with. A candidate is usable when it is not already
+/// decided, not in `prohibited_candidates`, and does not conflict with the
+/// set; that is the candidate set `C ⊆ A \ (R(S) ∪ R⁻¹(S) ∪ P)` of the
+/// paper's Algorithm 1, and the same predicate has to be used for the
+/// counting, since selecting the smallest candidate set is only meaningful
+/// if unusable candidates are excluded from the counts too.
+///
+/// Conflicting arguments need no scan to find: `Node::known_defeated` is
+/// set exactly for `R(S)` by the semi-complete loop and for `R⁻¹(S)` by the
+/// quasi-complete loop, so once `pseudo_complete` has returned it *is*
+/// `R(S) ∪ R⁻¹(S)`. Only the self-attackers have to be supplied separately,
+/// in `self_attacking`, since they are a property of the framework rather
+/// than of the node (the paper puts them in the initial `P` instead).
+///
+/// Candidates are ordered so that the one with the fewest attackers of its
 /// own (hence the least likely to trigger further branching) is tried
 /// first, with ties broken by argument id. Both the search over undefeated
 /// attackers and this ordering are made fully deterministic on purpose:
@@ -34,7 +47,19 @@ struct Frame {
 ///
 /// `node` must not be self-defending, i.e. some member must have an
 /// undefeated attacker.
-fn candidates(node: &Node, af: &AF, prohibited_candidates: &HashSet<usize>) -> Vec<usize> {
+fn candidates(
+    node: &Node,
+    af: &AF,
+    prohibited_candidates: &HashSet<usize>,
+    self_attacking: &[bool],
+) -> Vec<usize> {
+    let usable = |c: usize| {
+        !node.is_prohibited(c)
+            && !prohibited_candidates.contains(&c)
+            && !node.known_defeated(c)
+            && !self_attacking[c]
+    };
+
     let mut best_attacker: Option<usize> = None;
     let mut best_count = usize::MAX;
     for m in 0..af.argument_count() {
@@ -42,12 +67,16 @@ fn candidates(node: &Node, af: &AF, prohibited_candidates: &HashSet<usize>) -> V
             continue;
         }
         for &b in af.attackers(m) {
-            if node.is_defeated(af, b) {
+            // Equivalent to node.is_defeated(af, b), but O(1): the
+            // semi-complete loop sets defeat_propagated for exactly the
+            // arguments some member attacks, and pseudo_complete has
+            // drained its worklist by the time we get here. Worth the
+            // indirection -- this runs for every attacker of every
+            // undefended member, and is_defeated walks an attacker set.
+            if node.defeat_propagated(b) {
                 continue;
             }
-            let count = af.attackers(b)
-                .filter(|&&c| !node.is_prohibited(c) && !prohibited_candidates.contains(&c))
-                .count();
+            let count = af.attackers(b).filter(|&&c| usable(c)).count();
             let better = match best_attacker {
                 None => true,
                 Some(current) => count < best_count || (count == best_count && b < current),
@@ -63,7 +92,7 @@ fn candidates(node: &Node, af: &AF, prohibited_candidates: &HashSet<usize>) -> V
         .expect("a non-self-defending node must have an undefeated attacker");
 
     let mut result: Vec<usize> = af.attackers(b)
-        .filter(|&c| !node.is_prohibited(*c) && !prohibited_candidates.contains(c))
+        .filter(|&&c| usable(c))
         .copied()
         .collect();
     result.sort_by_key(|&c| (af.attacker_count(c), c));
@@ -109,6 +138,12 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     let mut candidate_count_sum: usize = 0;
     let mut candidate_count_max: usize = 0;
     let mut candidate_count_min: usize = usize::MAX;
+
+    // Self-attacking arguments can never belong to a conflict-free set, so
+    // they are never usable candidates. This depends only on the framework,
+    // not on the search state, so it is computed once here rather than per
+    // node (the paper folds it into the initial prohibited set instead).
+    let self_attacking: Vec<bool> = (0..af.argument_count()).map(|a| af.attacks(a, a)).collect();
 
     let mut current_node = Node::new(af);
 
@@ -165,7 +200,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     // No candidate has been tried yet, so nothing is prohibited beyond what
     // conflicts_with already rejects dynamically.
     let prohibited_candidates = HashSet::new();
-    let root_candidates = candidates(&current_node, af, &prohibited_candidates);
+    let root_candidates = candidates(&current_node, af, &prohibited_candidates, &self_attacking);
     frames_created += 1;
     candidate_count_sum += root_candidates.len();
     candidate_count_max = candidate_count_max.max(root_candidates.len());
@@ -236,7 +271,8 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                 }
                 return Some(child.arguments());
             }
-            let child_candidates = candidates(&child, af, &child_prohibited_candidates);
+            let child_candidates =
+                candidates(&child, af, &child_prohibited_candidates, &self_attacking);
             frames_created += 1;
             candidate_count_sum += child_candidates.len();
             candidate_count_max = candidate_count_max.max(child_candidates.len());
@@ -321,6 +357,33 @@ mod tests {
         assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
 
         let prohibited = HashSet::from([3]);
-        assert_eq!(candidates(&node, &af, &prohibited), vec![2]);
+        let self_attacking = vec![false; af.argument_count()];
+        assert_eq!(candidates(&node, &af, &prohibited, &self_attacking), vec![2]);
+    }
+
+    #[test]
+    fn test_candidates_excludes_conflicting() {
+        // 1 attacks the target 0 and must be defeated. Its attackers 2, 3
+        // and 4 are the would-be defenders, but 2 is itself attacked by 0,
+        // so it conflicts with the set and could never be added -- the
+        // paper's Algorithm 1 forms its candidates from
+        // A \ (R(S) ∪ R⁻¹(S) ∪ P), so 2 must not be offered. 3 and 4 both
+        // stay available, which also keeps the single-defender rule from
+        // resolving 1 on its own.
+        let mut af = AF::new(5);
+        af.add_attack(1, 0);
+        af.add_attack(2, 1);
+        af.add_attack(3, 1);
+        af.add_attack(4, 1);
+        af.add_attack(0, 2);
+        let mut node = Node::new(&af);
+        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+
+        let self_attacking = vec![false; af.argument_count()];
+        let result = candidates(&node, &af, &HashSet::new(), &self_attacking);
+        assert!(!result.contains(&2), "2 is attacked by the set, so it can never be added");
+        // Both remaining candidates are unattacked, so they tie on attacker
+        // count and order by id -- reversed, since the search pops from the back.
+        assert_eq!(result, vec![4, 3]);
     }
 }
