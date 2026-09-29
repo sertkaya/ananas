@@ -16,14 +16,16 @@ pub struct Node {
     // Whether an argument's defeat has already been propagated to its own
     // victims' unattacked_attackers_count, indexed by argument id
     defeat_propagated: Vec<bool>,
-    // Number of attackers of each argument not yet confirmed to also attack
-    // this node's set (quasi-complete: reaching 0 means every attacker of
-    // the argument attacks the set too, regardless of whether the argument
-    // itself is defended)
-    unconfirmed_attackers_count: Vec<usize>,
-    // Whether an argument's status as an attacker of this node's set has
-    // already been propagated to its own victims' unconfirmed_attackers_count
-    attacks_set_propagated: Vec<bool>,
+    // Number of attackers of each argument not yet known to be defeated in
+    // every completion of this node's set. An attacker counts as known
+    // defeated either because a member of the set attacks it, or because it
+    // attacks a member (a complete extension must defend its members, so it
+    // must attack back). Reaching 0 means every attacker of the argument is
+    // defeated in any completion, so the argument is defended and must be in.
+    undefeated_attackers_count: Vec<usize>,
+    // Whether an argument's being defeated in every completion has already
+    // been propagated to its own victims' undefeated_attackers_count
+    known_defeated: Vec<bool>,
 }
 
 // Create a new node
@@ -36,17 +38,17 @@ impl Node {
             .collect();
         let prohibited = vec![false; af.argument_count()];
         let defeat_propagated = vec![false; af.argument_count()];
-        let unconfirmed_attackers_count = (0..af.argument_count())
+        let undefeated_attackers_count = (0..af.argument_count())
             .map(|a| af.attacker_count(a))
             .collect();
-        let attacks_set_propagated = vec![false; af.argument_count()];
+        let known_defeated = vec![false; af.argument_count()];
         Node {
             node_args,
             unattacked_attackers_count,
             prohibited,
             defeat_propagated,
-            unconfirmed_attackers_count,
-            attacks_set_propagated,
+            undefeated_attackers_count,
+            known_defeated,
         }
     }
 
@@ -103,31 +105,26 @@ impl Node {
         self.defeat_propagated[arg] = true;
     }
 
-    /// Get the number of `arg`'s attackers not yet confirmed to also attack
-    /// this node's set
-    pub fn unconfirmed_attackers_count(&self, arg: usize) -> usize {
-        self.unconfirmed_attackers_count[arg]
+    /// Decrement the number of `arg`'s attackers not yet known to be
+    /// defeated in every completion, and return the new count
+    pub fn decrement_undefeated_attackers(&mut self, arg: usize) -> usize {
+        self.undefeated_attackers_count[arg] -= 1;
+        self.undefeated_attackers_count[arg]
     }
 
-    /// Decrement the number of `arg`'s attackers not yet confirmed to also
-    /// attack this node's set, and return the new count
-    pub fn decrement_unconfirmed_attackers(&mut self, arg: usize) -> usize {
-        self.unconfirmed_attackers_count[arg] -= 1;
-        self.unconfirmed_attackers_count[arg]
+    /// Check whether `arg`'s being defeated in every completion has already
+    /// been propagated to its own victims. That `arg` is defeated is a
+    /// one-time fact no matter how many ways it is established -- attacked
+    /// by a member, attacking a member, or both -- so this must only ever
+    /// happen once, or its victims' counts would be decremented twice for
+    /// the same attacker.
+    pub fn known_defeated(&self, arg: usize) -> bool {
+        self.known_defeated[arg]
     }
 
-    /// Check whether `arg`'s status as an attacker of this node's set has
-    /// already been propagated to its own victims. `arg` attacking the set
-    /// is a one-time fact regardless of how many members of the set it
-    /// attacks, so this must only ever happen once.
-    pub fn attacks_set_propagated(&self, arg: usize) -> bool {
-        self.attacks_set_propagated[arg]
-    }
-
-    /// Mark `arg`'s status as an attacker of this node's set as having been
-    /// propagated
-    pub fn mark_attacks_set_propagated(&mut self, arg: usize) {
-        self.attacks_set_propagated[arg] = true;
+    /// Mark `arg` as defeated in every completion, with that fact propagated
+    pub fn mark_known_defeated(&mut self, arg: usize) {
+        self.known_defeated[arg] = true;
     }
 
     /// Check whether `arg` conflicts with this node's set of arguments,

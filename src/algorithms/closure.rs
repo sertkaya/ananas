@@ -2,12 +2,21 @@ use std::collections::HashSet;
 use crate::af::AF;
 use crate::algorithms::node::Node;
 
-/// Extend `node` with its smallest pseudo-complete superset: repeatedly
-/// apply the semi-complete rule (an argument all of whose attackers have
-/// already been defeated by `node`'s current arguments is itself added) and
-/// the quasi-complete rule (an argument all of whose attackers also attack
-/// `node`'s current arguments is itself added, whether or not it is
-/// defended) until neither can add anything more.
+/// Extend `node` with its smallest pseudo-complete superset.
+///
+/// Both closure rules rest on the same observation: an argument `b` is
+/// defeated in *every* complete extension containing `node`'s current
+/// arguments as soon as either a member attacks `b` (semi-complete) or `b`
+/// attacks a member, since a complete extension defends its members and so
+/// must attack `b` back (quasi-complete). Once all of some argument's
+/// attackers are known defeated that way, it is defended in every
+/// completion and is added, whether or not it is defended *yet*.
+///
+/// The two routes therefore share one counter, so an argument whose
+/// attackers are covered by a mixture of them is still forced -- which two
+/// separate per-rule counters would miss.
+///
+/// The rules are applied repeatedly until neither can add anything more.
 /// `update` is a stack of arguments to add to `node` and whose effect on
 /// their attacked arguments' victims (semi-complete) and their attackers'
 /// other victims (quasi-complete) still needs to be propagated.
@@ -40,24 +49,41 @@ pub fn pseudo_complete(
     while let Some(arg) = update.pop() {
         // --- begin: semi-complete closure ---
         for &victim in af.victims(arg) {
-            // `victim` being defeated is a one-time fact: if another of its
-            // attackers already got accepted earlier and propagated this,
-            // doing it again would double-count `victim`'s defeat against
-            // its own victims' counts.
-            if node.defeat_propagated(victim) {
+            // A member of the set attacks `victim`, so `victim` is defeated
+            // outright. Two separate facts follow, each propagated at most
+            // once: that it is *actually* defeated by the set so far (which
+            // feeds the defended-check used by is_self_defending and
+            // candidates), and that it is defeated in *every* completion
+            // (which drives forcing, and may already be known because it
+            // attacks a member -- see the quasi-complete rule below).
+            // Propagating either twice would double-count this one attacker
+            // against its victims' counts.
+            let first_defeat = !node.defeat_propagated(victim);
+            let first_known = !node.known_defeated(victim);
+            if !first_defeat && !first_known {
                 continue;
             }
-            node.mark_defeat_propagated(victim);
+            if first_defeat {
+                node.mark_defeat_propagated(victim);
+            }
+            if first_known {
+                node.mark_known_defeated(victim);
+            }
 
             for &victim_of_victim in af.victims(victim) {
-                // No is_prohibited guard here: defeat_propagated already
-                // ensures each real attacker of victim_of_victim contributes
-                // at most one decrement (deduplicated per attacker, not per
-                // target), so this can never be called more times than
-                // victim_of_victim's original attacker count -- including
-                // for forced/seeded arguments, whose count must keep being
-                // updated after they're already in the set.
-                if node.decrement_unattacked_attackers(victim_of_victim) == 0 {
+                // No is_prohibited guard here: the flags above already
+                // ensure each real attacker of victim_of_victim contributes
+                // at most one decrement to each counter (deduplicated per
+                // attacker, not per target), so neither can be called more
+                // times than victim_of_victim's original attacker count --
+                // including for forced/seeded arguments, whose counts must
+                // keep being updated after they're already in the set.
+                if first_defeat {
+                    node.decrement_unattacked_attackers(victim_of_victim);
+                }
+                if first_known
+                    && node.decrement_undefeated_attackers(victim_of_victim) == 0
+                {
                     if node.conflicts_with(af, victim_of_victim)
                         || prohibited_candidates.contains(&victim_of_victim)
                     {
@@ -72,15 +98,16 @@ pub fn pseudo_complete(
 
         // --- begin: quasi-complete closure ---
         for &attacker in af.attackers(arg) {
-            // `attacker` being confirmed to attack `node`'s set is a
-            // one-time fact: if it was already confirmed via a different
-            // member of the set, doing it again would double-count it
-            // against its other victims' counts. Same reasoning as
-            // defeat_propagated above, mirrored for the quasi-complete rule.
-            if node.attacks_set_propagated(attacker) {
+            // `attacker` attacks a member of the set. A complete extension
+            // must defend its members, so any completion attacks `attacker`
+            // back: it too is defeated in every completion. That is the same
+            // fact the semi-complete rule above establishes by the other
+            // route, so it shares the flag -- whichever route reaches an
+            // argument first, the second must not decrement again.
+            if node.known_defeated(attacker) {
                 continue;
             }
-            node.mark_attacks_set_propagated(attacker);
+            node.mark_known_defeated(attacker);
 
             // --- begin: single-attacker (P-pseudo-complete) optimization ---
             // Section 4.2 of the paper: if `attacker` is an undefeated
@@ -106,7 +133,7 @@ pub fn pseudo_complete(
             // --- end: single-attacker (P-pseudo-complete) optimization ---
 
             for &co_victim in af.victims(attacker) {
-                if node.decrement_unconfirmed_attackers(co_victim) == 0 {
+                if node.decrement_undefeated_attackers(co_victim) == 0 {
                     if node.conflicts_with(af, co_victim)
                         || prohibited_candidates.contains(&co_victim)
                     {
@@ -273,6 +300,37 @@ mod tests {
             node.contains(4),
             "4's only attacker (3) also attacks the set, so quasi-complete must add it"
         );
+    }
+
+    // Mixed defeat routes: 3's two attackers are each known defeated by a
+    // different route -- 1 because the member 0 attacks it (semi-complete),
+    // 2 because it attacks the member 0, so any complete extension
+    // containing 0 must attack it back (quasi-complete). Neither rule alone
+    // covers all of 3's attackers, so tracking the routes in separate
+    // counters leaves 3 unforced; sharing one counter forces it. 4 and 5
+    // mutually attack and both attack 2, so 2 has two possible defenders
+    // and the single-defender rule cannot resolve it instead.
+    #[test]
+    fn test_pseudo_complete_mixed_defeat_routes() {
+        let mut af = AF::new(6);
+        af.add_attack(0, 1);
+        af.add_attack(1, 3);
+        af.add_attack(2, 3);
+        af.add_attack(2, 0);
+        af.add_attack(4, 2);
+        af.add_attack(5, 2);
+        af.add_attack(4, 5);
+        af.add_attack(5, 4);
+        let mut node = Node::new(&af);
+
+        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+
+        println!("{}", node);
+        assert!(node.contains(3), "3's attackers are defeated by one route each");
+        // The only complete extensions containing 0 are {0,3,4} and {0,3,5},
+        // so 3 is forced but the choice between 4 and 5 is left to the search.
+        assert!(!node.contains(4));
+        assert!(!node.contains(5));
     }
 
     // Single-defender chain (paper Section 4.2 / Figure 3): forcing 0 in
