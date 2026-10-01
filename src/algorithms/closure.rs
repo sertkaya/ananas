@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use crate::af::AF;
 use crate::algorithms::node::Node;
 
@@ -20,27 +19,22 @@ use crate::algorithms::node::Node;
 /// `update` is a stack of arguments to add to `node` and whose effect on
 /// their attacked arguments' victims (semi-complete) and their attackers'
 /// other victims (quasi-complete) still needs to be propagated.
-/// `prohibited_candidates` are arguments already known to be unsuitable
-/// (e.g. previously-failed search candidates in this branch); the closure
-/// must not be forced to include any of them.
+///
+/// Arguments already ruled out of `node` (`Node::is_out`, e.g.
+/// previously-failed search candidates in this branch) must not be forced
+/// back in by the closure.
 ///
 /// Returns `false` as soon as an argument that would be added conflicts with
 /// `node`'s current set (in either attack direction, including self-attack)
-/// or is in `prohibited_candidates`, leaving `node` in a discarded,
-/// no-longer-meaningful state. Returns `true` if the closure completed
-/// without any conflict.
+/// or has been ruled out, leaving `node` in a discarded, no-longer-meaningful
+/// state. Returns `true` if the closure completed without any conflict.
 #[must_use]
-pub fn pseudo_complete(
-    mut update: Vec<usize>,
-    node: &mut Node,
-    af: &AF,
-    prohibited_candidates: &HashSet<usize>,
-) -> bool {
+pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool {
     // Mark the seed arguments as added up front, before any propagation, so
-    // that a seed sitting deeper on the stack is already prohibited if some
+    // that a seed sitting deeper on the stack is already in the set if some
     // other seed's propagation happens to target it first.
     for &arg in &update {
-        if node.conflicts_with(af, arg) || prohibited_candidates.contains(&arg) {
+        if node.conflicts_with(af, arg) || node.is_out(arg) {
             return false;
         }
         node.add_argument(arg);
@@ -71,7 +65,7 @@ pub fn pseudo_complete(
             }
 
             for &victim_of_victim in af.victims(victim) {
-                // No is_prohibited guard here: the flags above already
+                // No already-in-the-set guard here: the flags above already
                 // ensure each real attacker of victim_of_victim contributes
                 // at most one decrement to each counter (deduplicated per
                 // attacker, not per target), so neither can be called more
@@ -85,7 +79,7 @@ pub fn pseudo_complete(
                     && node.decrement_undefeated_attackers(victim_of_victim) == 0
                 {
                     if node.conflicts_with(af, victim_of_victim)
-                        || prohibited_candidates.contains(&victim_of_victim)
+                        || node.is_out(victim_of_victim)
                     {
                         return false;
                     }
@@ -118,17 +112,13 @@ pub fn pseudo_complete(
             // branch.
             if !node.is_defeated(af, attacker) {
                 let remaining: Vec<usize> = af.attackers(attacker)
-                    .filter(|&&b| {
-                        !node.is_prohibited(b)
-                            && !prohibited_candidates.contains(&b)
-                            && !node.conflicts_with(af, b)
-                    })
+                    .filter(|&&b| !node.is_out(b) && !node.conflicts_with(af, b))
                     .copied()
                     .collect();
                 if remaining.is_empty() {
                     // `attacker` attacks the set, nothing in the set
                     // defeats it, and every one of its own attackers is
-                    // prohibited or conflicts with the set. The set can
+                    // ruled out or conflicts with the set. The set can
                     // never be defended against it, so this branch is
                     // already dead. Saying so here saves the search a
                     // candidate scan that could only return an empty list.
@@ -144,7 +134,7 @@ pub fn pseudo_complete(
             for &co_victim in af.victims(attacker) {
                 if node.decrement_undefeated_attackers(co_victim) == 0 {
                     if node.conflicts_with(af, co_victim)
-                        || prohibited_candidates.contains(&co_victim)
+                        || node.is_out(co_victim)
                     {
                         return false;
                     }
@@ -178,7 +168,7 @@ mod tests {
         let af = build_af();
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        assert!(pseudo_complete(vec![0], &mut node, &af));
 
         assert!(node.contains(0));
         assert!(!node.contains(1));
@@ -205,7 +195,7 @@ mod tests {
             }
         }
 
-        assert!(pseudo_complete(update, &mut node, &af, &HashSet::new()));
+        assert!(pseudo_complete(update, &mut node, &af));
 
         for arg in 0..af.argument_count() {
             assert!(!node.contains(arg));
@@ -218,14 +208,14 @@ mod tests {
     // Regression test: jelia23-example.af has a mutual attack 0<->1. If an
     // already-accepted argument (0) got re-pushed and re-processed via the
     // cycle, its own unattacked-attacker count would be decremented past
-    // what it started at, underflowing. `is_prohibited` must stop that.
+    // what it started at, underflowing. The propagation flags must stop that.
     #[test]
     fn test_pseudo_complete_mutual_attack_cycle() -> std::io::Result<()> {
         let input_af = File::open("tests/jelia23-example.af")?;
         let af = read_af(input_af);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        assert!(pseudo_complete(vec![0], &mut node, &af));
 
         assert!(node.contains(0));
         assert!(!node.contains(1));
@@ -248,7 +238,7 @@ mod tests {
         af.add_attack(2, 0);
         let mut node = Node::new(&af);
 
-        assert!(!pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        assert!(!pseudo_complete(vec![0], &mut node, &af));
     }
 
     // Regression test: 0 and 1 both attack 2 (attacker_count(2)=2); 2 and 4
@@ -267,7 +257,7 @@ mod tests {
         af.add_attack(4, 4);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0, 1], &mut node, &af, &HashSet::new()));
+        assert!(pseudo_complete(vec![0, 1], &mut node, &af));
 
         println!("{}", node);
         assert!(!node.contains(3), "3's attacker 4 was never defeated");
@@ -283,8 +273,9 @@ mod tests {
         af.add_attack(0, 1);
         af.add_attack(1, 2);
         let mut node = Node::new(&af);
+        node.rule_out(2);
 
-        assert!(!pseudo_complete(vec![0], &mut node, &af, &HashSet::from([2])));
+        assert!(!pseudo_complete(vec![0], &mut node, &af));
     }
 
     // Quasi-complete rule in isolation: 0 -> 1 -> 2 means forcing 0 in
@@ -311,7 +302,7 @@ mod tests {
         af.add_attack(6, 5);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        assert!(pseudo_complete(vec![0], &mut node, &af));
 
         println!("{}", node);
         assert!(node.contains(2), "2 is defended once 0 defeats its attacker 1");
@@ -334,7 +325,7 @@ mod tests {
         af.add_attack(0, 2);
         let mut node = Node::new(&af);
 
-        assert!(!pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        assert!(!pseudo_complete(vec![0], &mut node, &af));
     }
 
     // Mixed defeat routes: 3's two attackers are each known defeated by a
@@ -358,7 +349,7 @@ mod tests {
         af.add_attack(5, 4);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        assert!(pseudo_complete(vec![0], &mut node, &af));
 
         println!("{}", node);
         assert!(node.contains(3), "3's attackers are defeated by one route each");
@@ -383,7 +374,7 @@ mod tests {
         af.add_attack(4, 3);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        assert!(pseudo_complete(vec![0], &mut node, &af));
 
         println!("{}", node);
         assert!(node.contains(2), "2 is 1's only possible defender");

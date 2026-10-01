@@ -10,7 +10,6 @@ use crate::algorithms::node::Node;
 struct Frame {
     node: Node,
     candidates: Vec<usize>,
-    prohibited_candidates: HashSet<usize>,
     // The candidate whose subtree we just pushed on top of this frame, if
     // any. If this frame is popped again while this is set, that subtree
     // must have failed entirely without success (a success would have
@@ -47,17 +46,9 @@ struct Frame {
 ///
 /// `node` must not be self-defending, i.e. some member must have an
 /// undefeated attacker.
-fn candidates(
-    node: &Node,
-    af: &AF,
-    prohibited_candidates: &HashSet<usize>,
-    self_attacking: &[bool],
-) -> Vec<usize> {
+fn candidates(node: &Node, af: &AF, self_attacking: &[bool]) -> Vec<usize> {
     let usable = |c: usize| {
-        !node.is_prohibited(c)
-            && !prohibited_candidates.contains(&c)
-            && !node.known_defeated(c)
-            && !self_attacking[c]
+        !node.is_out(c) && !node.known_defeated(c) && !self_attacking[c]
     };
 
     let mut best_attacker: Option<usize> = None;
@@ -158,7 +149,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     }
 
     pseudo_complete_calls += 1;
-    if !pseudo_complete(update, &mut current_node, af, &HashSet::new()) {
+    if !pseudo_complete(update, &mut current_node, af) {
         // The hypothesis that `arg` is in the extension is already
         // contradictory: closing it produced a conflict.
         if verbose {
@@ -197,10 +188,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         return Some(current_node.arguments());
     }
 
-    // No candidate has been tried yet, so nothing is prohibited beyond what
-    // conflicts_with already rejects dynamically.
-    let prohibited_candidates = HashSet::new();
-    let root_candidates = candidates(&current_node, af, &prohibited_candidates, &self_attacking);
+    let root_candidates = candidates(&current_node, af, &self_attacking);
     frames_created += 1;
     candidate_count_sum += root_candidates.len();
     candidate_count_max = candidate_count_max.max(root_candidates.len());
@@ -208,7 +196,6 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     let mut stack: Vec<Frame> = vec![Frame {
         node: current_node,
         candidates: root_candidates,
-        prohibited_candidates,
         pending_candidate: None,
     }];
 
@@ -234,7 +221,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // this branch, even as a side effect of a different candidate's
         // closure.
         if let Some(failed) = frame.pending_candidate.take() {
-            frame.prohibited_candidates.insert(failed);
+            frame.node.rule_out(failed);
         }
 
         // Take just one untried candidate; leave the rest for later, so a
@@ -244,8 +231,9 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
             continue;
         };
 
+        // The out-set rides along inside the node, so this one clone
+        // carries the whole partial assignment to the child.
         let mut child = frame.node.clone();
-        let child_prohibited_candidates = frame.prohibited_candidates.clone();
 
         // Push this frame back before trying c, regardless of outcome: if c
         // fails immediately, we'll pop it again right away; if it needs a
@@ -254,7 +242,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         stack.push(frame);
 
         pseudo_complete_calls += 1;
-        if pseudo_complete(vec![c], &mut child, af, &child_prohibited_candidates) {
+        if pseudo_complete(vec![c], &mut child, af) {
             if child.is_self_defending() {
                 if verbose {
                     eprintln!(
@@ -271,8 +259,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                 }
                 return Some(child.arguments());
             }
-            let child_candidates =
-                candidates(&child, af, &child_prohibited_candidates, &self_attacking);
+            let child_candidates = candidates(&child, af, &self_attacking);
             frames_created += 1;
             candidate_count_sum += child_candidates.len();
             candidate_count_max = candidate_count_max.max(child_candidates.len());
@@ -280,7 +267,6 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
             stack.push(Frame {
                 node: child,
                 candidates: child_candidates,
-                prohibited_candidates: child_prohibited_candidates,
                 pending_candidate: None,
             });
         }
@@ -344,21 +330,29 @@ mod tests {
     }
 
     #[test]
-    fn test_candidates_excludes_prohibited() {
-        // 0 attacks the target 1's... wait, 1 attacks 0; both 2 and 3 attack
-        // 1. If 3 is already known-prohibited (e.g. a previously-failed
-        // candidate elsewhere in this branch), it must not be offered again
-        // as a candidate to defeat 1.
-        let mut af = AF::new(4);
+    fn test_candidates_excludes_ruled_out() {
+        // 1 attacks the target 0; 2, 3 and 4 all attack 1. If 4 has been
+        // ruled out (e.g. its subtree already failed higher in this branch)
+        // it must not be offered again as a candidate for defeating 1.
+        // Three attackers rather than two, so that ruling one out still
+        // leaves a genuine choice -- with only one survivor the
+        // single-defender rule would resolve 1 inside the closure and there
+        // would be nothing left to select.
+        let mut af = AF::new(5);
         af.add_attack(1, 0);
         af.add_attack(2, 1);
         af.add_attack(3, 1);
+        af.add_attack(4, 1);
         let mut node = Node::new(&af);
-        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        node.rule_out(4);
+        assert!(pseudo_complete(vec![0], &mut node, &af));
 
-        let prohibited = HashSet::from([3]);
         let self_attacking = vec![false; af.argument_count()];
-        assert_eq!(candidates(&node, &af, &prohibited, &self_attacking), vec![2]);
+        let result = candidates(&node, &af, &self_attacking);
+        assert!(!result.contains(&4), "4 was ruled out for this branch");
+        // Both survivors are unattacked, so they tie on attacker count and
+        // order by id -- reversed, since the search pops from the back.
+        assert_eq!(result, vec![3, 2]);
     }
 
     #[test]
@@ -377,10 +371,10 @@ mod tests {
         af.add_attack(4, 1);
         af.add_attack(0, 2);
         let mut node = Node::new(&af);
-        assert!(pseudo_complete(vec![0], &mut node, &af, &HashSet::new()));
+        assert!(pseudo_complete(vec![0], &mut node, &af));
 
         let self_attacking = vec![false; af.argument_count()];
-        let result = candidates(&node, &af, &HashSet::new(), &self_attacking);
+        let result = candidates(&node, &af, &self_attacking);
         assert!(!result.contains(&2), "2 is attacked by the set, so it can never be added");
         // Both remaining candidates are unattacked, so they tie on attacker
         // count and order by id -- reversed, since the search pops from the back.

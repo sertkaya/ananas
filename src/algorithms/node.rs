@@ -10,9 +10,12 @@ pub struct Node {
     node_args: Vec<bool>,
     // Number of unattacked attackers for each argument
     unattacked_attackers_count: Vec<usize>,
-    // Whether an argument is prohibited from being added to node_args,
-    // indexed by argument id
-    prohibited: Vec<bool>,
+    // Whether an argument has been ruled out of this node's set, indexed
+    // by argument id. Together with node_args this is the search's partial
+    // assignment: in, out, or still undecided. An argument lands here when
+    // a candidate's whole subtree failed, and it is a hard constraint --
+    // the closure must fail rather than force one of these back in.
+    out: Vec<bool>,
     // Whether an argument's defeat has already been propagated to its own
     // victims' unattacked_attackers_count, indexed by argument id
     defeat_propagated: Vec<bool>,
@@ -36,7 +39,7 @@ impl Node {
         let unattacked_attackers_count = (0..af.argument_count())
             .map(|a| af.attacker_count(a))
             .collect();
-        let prohibited = vec![false; af.argument_count()];
+        let out = vec![false; af.argument_count()];
         let defeat_propagated = vec![false; af.argument_count()];
         let undefeated_attackers_count = (0..af.argument_count())
             .map(|a| af.attacker_count(a))
@@ -45,7 +48,7 @@ impl Node {
         Node {
             node_args,
             unattacked_attackers_count,
-            prohibited,
+            out,
             defeat_propagated,
             undefeated_attackers_count,
             known_defeated,
@@ -55,7 +58,6 @@ impl Node {
     /// Add an argument to this node's set of arguments
     pub fn add_argument(&mut self, arg: usize) {
         self.node_args[arg] = true;
-        self.prohibit(arg);
     }
 
     /// Check whether an argument is part of this node's set of arguments
@@ -75,15 +77,17 @@ impl Node {
         self.unattacked_attackers_count[arg]
     }
 
-    /// Check whether an argument is prohibited from being added to this
-    /// node's set of arguments
-    pub fn is_prohibited(&self, arg: usize) -> bool {
-        self.prohibited[arg]
+    /// Check whether an argument has been ruled out of this node's set
+    pub fn is_out(&self, arg: usize) -> bool {
+        self.out[arg]
     }
 
-    /// Prohibit an argument from being added to this node's set of arguments
-    pub fn prohibit(&mut self, arg: usize) {
-        self.prohibited[arg] = true;
+    /// Rule an argument out of this node's set, and of every node derived
+    /// from it. Used when a candidate's whole subtree has failed: it must
+    /// never come back, not even as a side effect of some other
+    /// candidate's closure.
+    pub fn rule_out(&mut self, arg: usize) {
+        self.out[arg] = true;
     }
 
     /// Check whether `arg` is attacked by any argument already in this
