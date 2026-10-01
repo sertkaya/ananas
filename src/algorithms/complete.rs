@@ -67,7 +67,9 @@ fn candidates(node: &Node, af: &AF, self_attacking: &[bool]) -> Vec<usize> {
             if node.defeat_propagated(b) {
                 continue;
             }
-            let count = af.attackers(b).filter(|&&c| usable(c)).count();
+            // Maintained incrementally by the closure, so this is a read
+            // rather than a scan of b's attackers.
+            let count = node.usable_defenders_count(b);
             let better = match best_attacker {
                 None => true,
                 Some(current) => count < best_count || (count == best_count && b < current),
@@ -99,6 +101,7 @@ fn format_stats(
     candidate_count_sum: usize,
     candidate_count_min: usize,
     candidate_count_max: usize,
+    empty_candidate_lists: usize,
 ) -> String {
     let avg = if frames_created > 0 {
         candidate_count_sum as f64 / frames_created as f64
@@ -109,7 +112,8 @@ fn format_stats(
     format!(
         "nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls} \
          frames_created={frames_created} candidates_avg={avg:.2} \
-         candidates_min={min} candidates_max={candidate_count_max}"
+         candidates_min={min} candidates_max={candidate_count_max} \
+         empty_candidate_lists={empty_candidate_lists}"
     )
 }
 
@@ -129,6 +133,11 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     let mut candidate_count_sum: usize = 0;
     let mut candidate_count_max: usize = 0;
     let mut candidate_count_min: usize = usize::MAX;
+    // How often candidates() came back empty: the branch was already dead,
+    // but pseudo_complete did not notice, so we paid a full candidate scan
+    // to find out. Measures what the once-per-attacker no-defender check
+    // misses.
+    let mut empty_candidate_lists: usize = 0;
 
     // Self-attacking arguments can never belong to a conflict-free set, so
     // they are never usable candidates. This depends only on the framework,
@@ -161,7 +170,8 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                     frames_created,
                     candidate_count_sum,
                     candidate_count_min,
-                    candidate_count_max
+                    candidate_count_max,
+                    empty_candidate_lists
                 )
             );
         }
@@ -181,7 +191,8 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                     frames_created,
                     candidate_count_sum,
                     candidate_count_min,
-                    candidate_count_max
+                    candidate_count_max,
+                    empty_candidate_lists
                 )
             );
         }
@@ -189,6 +200,9 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     }
 
     let root_candidates = candidates(&current_node, af, &self_attacking);
+    if root_candidates.is_empty() {
+        empty_candidate_lists += 1;
+    }
     frames_created += 1;
     candidate_count_sum += root_candidates.len();
     candidate_count_max = candidate_count_max.max(root_candidates.len());
@@ -210,7 +224,8 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                     frames_created,
                     candidate_count_sum,
                     candidate_count_min,
-                    candidate_count_max
+                    candidate_count_max,
+                    empty_candidate_lists
                 ),
                 stack.len()
             );
@@ -221,7 +236,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // this branch, even as a side effect of a different candidate's
         // closure.
         if let Some(failed) = frame.pending_candidate.take() {
-            frame.node.rule_out(failed);
+            frame.node.rule_out(af, failed);
         }
 
         // Take just one untried candidate; leave the rest for later, so a
@@ -253,13 +268,17 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                     frames_created,
                     candidate_count_sum,
                     candidate_count_min,
-                    candidate_count_max
+                    candidate_count_max,
+                    empty_candidate_lists
                 )
             );
                 }
                 return Some(child.arguments());
             }
             let child_candidates = candidates(&child, af, &self_attacking);
+            if child_candidates.is_empty() {
+                empty_candidate_lists += 1;
+            }
             frames_created += 1;
             candidate_count_sum += child_candidates.len();
             candidate_count_max = candidate_count_max.max(child_candidates.len());
@@ -281,7 +300,8 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                 frames_created,
                 candidate_count_sum,
                 candidate_count_min,
-                candidate_count_max
+                candidate_count_max,
+                empty_candidate_lists
             )
         );
     }
@@ -344,7 +364,7 @@ mod tests {
         af.add_attack(3, 1);
         af.add_attack(4, 1);
         let mut node = Node::new(&af);
-        node.rule_out(4);
+        node.rule_out(&af, 4);
         assert!(pseudo_complete(vec![0], &mut node, &af));
 
         let self_attacking = vec![false; af.argument_count()];

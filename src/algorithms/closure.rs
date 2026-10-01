@@ -1,6 +1,55 @@
 use crate::af::AF;
 use crate::algorithms::node::Node;
 
+/// React to `b`'s usable-defender count having reached 0 or 1, where `b`
+/// is an attacker of the set that no member attacks back.
+///
+/// With no usable defender left the set can never be defended against `b`,
+/// so the branch is dead. With exactly one, that defender is forced --
+/// there is no alternative to branch on.
+///
+/// The count is maintained off `known_defeated`, which is set as members
+/// are popped rather than as they are added, so mid-propagation it can
+/// still count a defender that already conflicts. That only ever
+/// overestimates, so reaching 0 is conclusive; reaching 1 is not, and the
+/// survivor is re-checked exactly before being forced.
+///
+/// Returns `false` if the branch is dead.
+#[must_use]
+fn resolve_defenders(b: usize, node: &mut Node, af: &AF, update: &mut Vec<usize>) -> bool {
+    let count = node.usable_defenders_count(b);
+    if count > 1 {
+        // The common case, and a single array read: there is still a choice
+        // of defenders, so nothing is forced and nothing is settled.
+        return true;
+    }
+
+    // Only now, on the rare path, pay for the exact test of whether the set
+    // needs defending against `b` at all. The cheap flags lag during
+    // propagation, and acting on a stale one would force a defender for an
+    // argument that is already defeated or does not attack the set.
+    if node.is_defeated(af, b) || !af.victims(b).any(|&v| node.contains(v)) {
+        return true;
+    }
+
+    if count == 0 {
+        return false;
+    }
+    let survivor = af
+        .attackers(b)
+        .copied()
+        .find(|&c| node.is_usable_defender(c))
+        .expect("a count of one means exactly one defender is left");
+    if node.is_out(survivor) || node.conflicts_with(af, survivor) {
+        // The count had not caught up: the last defender is in fact
+        // unusable too, so there is really none left.
+        return false;
+    }
+    node.add_argument(survivor);
+    update.push(survivor);
+    true
+}
+
 /// Extend `node` with its smallest pseudo-complete superset.
 ///
 /// Both closure rules rest on the same observation: an argument `b` is
@@ -63,6 +112,12 @@ pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool
             if first_known {
                 node.mark_known_defeated(victim);
             }
+            // `victim` conflicts with the set now, so it is no longer
+            // available as anyone's defender. This subtracts it from its
+            // own victims' counts; the loop below then reacts to whichever
+            // of those counts became critical.
+            let first_removal = node.is_usable_defender(victim);
+            node.remove_as_defender(af, victim);
 
             for &victim_of_victim in af.victims(victim) {
                 // No already-in-the-set guard here: the flags above already
@@ -86,6 +141,11 @@ pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool
                     node.add_argument(victim_of_victim);
                     update.push(victim_of_victim);
                 }
+                if first_removal
+                    && !resolve_defenders(victim_of_victim, node, af, &mut update)
+                {
+                    return false;
+                }
             }
         }
         // --- end: semi-complete closure ---
@@ -102,32 +162,19 @@ pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool
                 continue;
             }
             node.mark_known_defeated(attacker);
+            let first_removal = node.is_usable_defender(attacker);
+            node.remove_as_defender(af, attacker);
 
             // --- begin: single-attacker (P-pseudo-complete) optimization ---
-            // Section 4.2 of the paper: if `attacker` is an undefeated
-            // attacker of the set with exactly one remaining possible
-            // defender, that defender is forced -- there's no alternative
-            // to branch on, so add it right here instead of waiting for
-            // the search to discover and try it as a single-candidate
-            // branch.
-            if !node.is_defeated(af, attacker) {
-                let remaining: Vec<usize> = af.attackers(attacker)
-                    .filter(|&&b| !node.is_out(b) && !node.conflicts_with(af, b))
-                    .copied()
-                    .collect();
-                if remaining.is_empty() {
-                    // `attacker` attacks the set, nothing in the set
-                    // defeats it, and every one of its own attackers is
-                    // ruled out or conflicts with the set. The set can
-                    // never be defended against it, so this branch is
-                    // already dead. Saying so here saves the search a
-                    // candidate scan that could only return an empty list.
-                    return false;
-                }
-                if remaining.len() == 1 {
-                    node.add_argument(remaining[0]);
-                    update.push(remaining[0]);
-                }
+            // Section 4.2 of the paper: if the set has exactly one
+            // remaining way to defend itself against `attacker`, that
+            // defender is forced -- there is no alternative to branch on.
+            // With no way left at all, the branch is dead. Driven off the
+            // maintained count rather than recomputed here, so it keeps
+            // firing as later additions shrink the choice, not only at the
+            // moment `attacker` is discovered.
+            if !resolve_defenders(attacker, node, af, &mut update) {
+                return false;
             }
             // --- end: single-attacker (P-pseudo-complete) optimization ---
 
@@ -140,6 +187,9 @@ pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool
                     }
                     node.add_argument(co_victim);
                     update.push(co_victim);
+                }
+                if first_removal && !resolve_defenders(co_victim, node, af, &mut update) {
+                    return false;
                 }
             }
         }
@@ -273,7 +323,7 @@ mod tests {
         af.add_attack(0, 1);
         af.add_attack(1, 2);
         let mut node = Node::new(&af);
-        node.rule_out(2);
+        node.rule_out(&af, 2);
 
         assert!(!pseudo_complete(vec![0], &mut node, &af));
     }

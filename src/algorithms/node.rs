@@ -29,6 +29,15 @@ pub struct Node {
     // Whether an argument's being defeated in every completion has already
     // been propagated to its own victims' undefeated_attackers_count
     known_defeated: Vec<bool>,
+    // Number of each argument's attackers that could still be added to the
+    // set, i.e. that are not ruled out, do not conflict with the set, and
+    // do not attack themselves. For an undefeated attacker of the set this
+    // is the number of ways left to defend the set against it: reaching 1
+    // forces that defender, and reaching 0 kills the branch.
+    usable_defenders_count: Vec<usize>,
+    // Whether an argument has stopped being a usable defender, with that
+    // fact already subtracted from its victims' usable_defenders_count
+    defender_removed: Vec<bool>,
 }
 
 // Create a new node
@@ -45,6 +54,15 @@ impl Node {
             .map(|a| af.attacker_count(a))
             .collect();
         let known_defeated = vec![false; af.argument_count()];
+        // A self-attacking argument belongs to no conflict-free set, so it
+        // is never a usable defender and is excluded from the counts here
+        // rather than being subtracted later.
+        let defender_removed: Vec<bool> = (0..af.argument_count())
+            .map(|a| af.attacks(a, a))
+            .collect();
+        let usable_defenders_count = (0..af.argument_count())
+            .map(|a| af.attackers(a).filter(|&&b| !defender_removed[b]).count())
+            .collect();
         Node {
             node_args,
             unattacked_attackers_count,
@@ -52,6 +70,8 @@ impl Node {
             defeat_propagated,
             undefeated_attackers_count,
             known_defeated,
+            usable_defenders_count,
+            defender_removed,
         }
     }
 
@@ -86,8 +106,36 @@ impl Node {
     /// from it. Used when a candidate's whole subtree has failed: it must
     /// never come back, not even as a side effect of some other
     /// candidate's closure.
-    pub fn rule_out(&mut self, arg: usize) {
+    pub fn rule_out(&mut self, af: &AF, arg: usize) {
         self.out[arg] = true;
+        self.remove_as_defender(af, arg);
+    }
+
+    /// Get the number of `arg`'s attackers that could still be added to the
+    /// set -- for an undefeated attacker of the set, the number of ways
+    /// left to defend against it
+    pub fn usable_defenders_count(&self, arg: usize) -> usize {
+        self.usable_defenders_count[arg]
+    }
+
+    /// Whether `arg` is still available to be added to the set as a defender
+    pub fn is_usable_defender(&self, arg: usize) -> bool {
+        !self.defender_removed[arg]
+    }
+
+    /// Record that `arg` can no longer be added to the set, subtracting it
+    /// from the usable-defender count of every argument it attacks.
+    /// Idempotent: an argument can stop being usable by being ruled out, by
+    /// coming to conflict with the set, or both, and its victims' counts
+    /// must only ever be decremented once for it.
+    pub fn remove_as_defender(&mut self, af: &AF, arg: usize) {
+        if self.defender_removed[arg] {
+            return;
+        }
+        self.defender_removed[arg] = true;
+        for &victim in af.victims(arg) {
+            self.usable_defenders_count[victim] -= 1;
+        }
     }
 
     /// Check whether `arg` is attacked by any argument already in this
