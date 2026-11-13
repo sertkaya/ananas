@@ -1,5 +1,5 @@
-use std::collections::hash_set::Iter;
 use std::collections::HashSet;
+use std::slice::Iter;
 use std::fmt::{Display, Formatter};
 
 /// Argumentation framework represented as adjacency list.
@@ -7,12 +7,14 @@ use std::fmt::{Display, Formatter};
 pub struct AF {
     // Number of arguments
     arg_count: usize,
-    // Adjacency list for attacks relation
-    // Vector of hash sets.
-    attacks: Vec<HashSet<usize>>,
-    // Adjacency list for attacked-by relation
-    // Vector of hash sets.
-    attacked_by: Vec<HashSet<usize>>,
+    // Adjacency list for attacks relation: for each argument, the
+    // arguments it attacks, sorted ascending and without duplicates.
+    // Sorted rather than hashed so that iteration order is a property of
+    // the framework, not of the per-process hash seed -- the search's
+    // propagation order, and so the work it does, must be reproducible.
+    attacks: Vec<Vec<usize>>,
+    // Adjacency list for attacked-by relation, kept the same way
+    attacked_by: Vec<Vec<usize>>,
 }
 
 impl Display for AF {
@@ -32,17 +34,19 @@ impl Display for AF {
 impl AF {
     /// Create a new argumentation framework with the given number of arguments
     pub fn new(size: usize) -> AF {
-        let attacks: Vec<HashSet<usize>> = vec![HashSet::new(); size];
-        let attacked_by: Vec<HashSet<usize>> = vec![HashSet::new(); size];
+        let attacks: Vec<Vec<usize>> = vec![Vec::new(); size];
+        let attacked_by: Vec<Vec<usize>> = vec![Vec::new(); size];
         AF { arg_count: size, attacks, attacked_by }
     }
 
-    /// Add an attack from the attacker to the victim
+    /// Add an attack from the attacker to the victim. Adding an attack
+    /// that is already present has no effect.
     pub fn add_attack(&mut self, attacker: usize, victim: usize) {
         // add the attack to the attacks relation
-        self.attacks[attacker].insert(victim);
-        // add the attack to the attacked-by relation
-        self.attacked_by[victim].insert(attacker);
+        if insert_sorted(&mut self.attacks[attacker], victim) {
+            // add the attack to the attacked-by relation
+            insert_sorted(&mut self.attacked_by[victim], attacker);
+        }
     }
 
     /// Get the number of arguments
@@ -70,17 +74,17 @@ impl AF {
 
     /// Check if argument a attacks argument b
     pub fn attacks(&self, a: usize, b: usize) -> bool {
-        self.attacks[a].contains(&b)
+        self.attacks[a].binary_search(&b).is_ok()
     }
 
     /// Check if argument a attacks any argument in the set s
     pub fn attacks_set(&self, a: usize, s: &HashSet<usize>) -> bool {
-        !self.attacks[a].is_disjoint(s)
+        self.attacks[a].iter().any(|v| s.contains(v))
     }
 
     /// Check if argument a is attacked by any argument in the set s
     pub fn attacked_by_set(&self, a: usize, s: &HashSet<usize>) -> bool {
-        !self.attacked_by[a].is_disjoint(s)
+        self.attacked_by[a].iter().any(|b| s.contains(b))
     }
 
     /// Check whether `set` defends `arg`: every attacker of `arg` is
@@ -112,6 +116,18 @@ impl AF {
     pub fn is_stable(&self, set: &HashSet<usize>) -> bool {
         self.is_conflict_free(set)
             && (0..self.arg_count).all(|a| set.contains(&a) || self.attacked_by_set(a, set))
+    }
+}
+
+/// Insert `x` into the sorted vector `list`, keeping it sorted. Returns
+/// `false`, leaving `list` unchanged, if `x` was already present.
+fn insert_sorted(list: &mut Vec<usize>, x: usize) -> bool {
+    match list.binary_search(&x) {
+        Ok(_) => false,
+        Err(pos) => {
+            list.insert(pos, x);
+            true
+        }
     }
 }
 
