@@ -1,201 +1,196 @@
 use crate::af::AF;
-use crate::algorithms::node::Node;
+use crate::algorithms::node::{Assignment, Lit, Node, Reason, Value};
 
-/// React to `b`'s usable-defender count having reached 0 or 1, where `b`
-/// is an attacker of the set that no member attacks back.
+/// Put `arg` in the set for `reason`, queueing it for propagation if that
+/// is new. Returns `false` if `arg` is already out.
+#[must_use]
+fn set_in(arg: usize, reason: Reason, node: &mut Node, queue: &mut Vec<Lit>) -> bool {
+    match node.assign(arg, Value::In, reason) {
+        Assignment::New => {
+            queue.push(Lit::In(arg));
+            true
+        }
+        Assignment::Unchanged => true,
+        Assignment::Conflict => false,
+    }
+}
+
+/// Rule `arg` out of the set for `reason`, queueing that for propagation if
+/// it is new. Returns `false` if `arg` is already in.
+#[must_use]
+fn set_out(arg: usize, reason: Reason, node: &mut Node, queue: &mut Vec<Lit>) -> bool {
+    match node.assign(arg, Value::Out, reason) {
+        Assignment::New => {
+            queue.push(Lit::Out(arg));
+            true
+        }
+        Assignment::Unchanged => true,
+        Assignment::Conflict => false,
+    }
+}
+
+/// Record that `arg` is defeated in every completion, queueing that for
+/// propagation if it is new. Cannot conflict: nothing ever records that an
+/// argument must stay undefeated.
+fn set_def(arg: usize, node: &mut Node, queue: &mut Vec<Lit>) {
+    if node.assign_def(arg) {
+        queue.push(Lit::Def(arg));
+    }
+}
+
+/// Check whether the set still has a way to defend itself against `b`,
+/// after `b` has become known defeated or one of its attackers has become
+/// unusable.
 ///
 /// With no usable defender left the set can never be defended against `b`,
 /// so the branch is dead. With exactly one, that defender is forced --
 /// there is no alternative to branch on.
 ///
-/// The count is maintained off `known_defeated`, which is set as members
-/// are popped rather than as they are added, so mid-propagation it can
-/// still count a defender that already conflicts. That only ever
-/// overestimates, so reaching 0 is conclusive; reaching 1 is not, and the
-/// survivor is re-checked exactly before being forced.
+/// The usable-defender count is decremented as out arguments are
+/// propagated, so it can lag behind the assignment and only ever
+/// overestimates. The cheap count settles the common case; below 2 the
+/// defenders are checked exactly against the assignment.
 ///
 /// Returns `false` if the branch is dead.
 #[must_use]
-fn resolve_defenders(b: usize, node: &mut Node, af: &AF, update: &mut Vec<usize>) -> bool {
-    let count = node.usable_defenders_count(b);
-    if count > 1 {
-        // The common case, and a single array read: there is still a choice
-        // of defenders, so nothing is forced and nothing is settled.
+fn resolve_defenders(b: usize, node: &mut Node, af: &AF, queue: &mut Vec<Lit>) -> bool {
+    if !node.known_defeated(b) || node.usable_defenders_count(b) > 1 {
+        // Either nothing demands that `b` be defeated, or there is still a
+        // choice of defenders: a flag and an array read, and nothing is
+        // forced or settled.
         return true;
     }
-
-    // Only now, on the rare path, pay for the exact test of whether the set
-    // needs defending against `b` at all. The cheap flags lag during
-    // propagation, and acting on a stale one would force a defender for an
-    // argument that is already defeated or does not attack the set.
-    if node.is_defeated(af, b) || !af.victims(b).any(|&v| node.contains(v)) {
+    if node.is_defeated(af, b) {
+        // A member already attacks `b`, so the demand is met.
         return true;
     }
-
-    if count == 0 {
-        return false;
+    // At most one attacker can be anything but out, since the count bounds
+    // them from above.
+    match af.attackers(b).copied().find(|&c| !node.is_out(c)) {
+        None => false,
+        Some(survivor) => set_in(survivor, Reason::OnlyDefender, node, queue),
     }
-    let survivor = af
-        .attackers(b)
-        .copied()
-        .find(|&c| node.is_usable_defender(c))
-        .expect("a count of one means exactly one defender is left");
-    if node.is_out(survivor) || node.conflicts_with(af, survivor) {
-        // The count had not caught up: the last defender is in fact
-        // unusable too, so there is really none left.
-        return false;
-    }
-    node.add_argument(survivor);
-    update.push(survivor);
-    true
 }
 
-/// Extend `node` with its smallest pseudo-complete superset.
+/// Propagate the consequences of the assignments in `queue` until nothing
+/// more follows, extending `node` to its smallest pseudo-complete superset.
 ///
 /// Both closure rules rest on the same observation: an argument `b` is
 /// defeated in *every* complete extension containing `node`'s current
 /// arguments as soon as either a member attacks `b` (semi-complete) or `b`
 /// attacks a member, since a complete extension defends its members and so
-/// must attack `b` back (quasi-complete). Once all of some argument's
-/// attackers are known defeated that way, it is defended in every
-/// completion and is added, whether or not it is defended *yet*.
+/// must attack `b` back (quasi-complete). Either way `b` is out and `Def(b)`
+/// holds. Once all of some argument's attackers are known defeated, it is
+/// defended in every completion and is put in, whether or not it is
+/// defended *yet* -- and since both routes feed the same counter, an
+/// argument whose attackers are covered by a mixture of them is put in too.
+/// Each argument that must be defeated also needs a usable defender: with
+/// one left it is put in (the P-pseudo-complete rule of Section 4.2), with
+/// none the branch is dead.
 ///
-/// The two routes therefore share one counter, so an argument whose
-/// attackers are covered by a mixture of them is still forced -- which two
-/// separate per-rule counters would miss.
+/// Every assignment is made eagerly, the moment it follows, and is only
+/// propagated later, in queue order; so an argument's value is exact even
+/// while the counters derived from it are catching up.
 ///
-/// The rules are applied repeatedly until neither can add anything more.
-/// `update` is a stack of arguments to add to `node` and whose effect on
-/// their attacked arguments' victims (semi-complete) and their attackers'
-/// other victims (quasi-complete) still needs to be propagated.
-///
-/// Arguments already ruled out of `node` (`Node::is_out`, e.g.
-/// previously-failed search candidates in this branch) must not be forced
-/// back in by the closure.
-///
-/// Returns `false` as soon as an argument that would be added conflicts with
-/// `node`'s current set (in either attack direction, including self-attack)
-/// or has been ruled out, leaving `node` in a discarded, no-longer-meaningful
-/// state. Returns `true` if the closure completed without any conflict.
+/// Returns `false` as soon as an argument would have to be both in and
+/// out, or would have to be defeated with no way left to defeat it,
+/// leaving `node` in a discarded, no-longer-meaningful state. Returns
+/// `true` if the closure completed without any conflict.
 #[must_use]
-pub fn pseudo_complete(mut update: Vec<usize>, node: &mut Node, af: &AF) -> bool {
-    // Mark the seed arguments as added up front, before any propagation, so
-    // that a seed sitting deeper on the stack is already in the set if some
-    // other seed's propagation happens to target it first.
-    for &arg in &update {
-        if node.conflicts_with(af, arg) || node.is_out(arg) {
-            return false;
-        }
-        node.add_argument(arg);
-    }
-
-    while let Some(arg) = update.pop() {
-        // --- begin: semi-complete closure ---
-        for &victim in af.victims(arg) {
-            // A member of the set attacks `victim`, so `victim` is defeated
-            // outright. Two separate facts follow, each propagated at most
-            // once: that it is *actually* defeated by the set so far (which
-            // feeds the defended-check used by is_self_defending and
-            // candidates), and that it is defeated in *every* completion
-            // (which drives forcing, and may already be known because it
-            // attacks a member -- see the quasi-complete rule below).
-            // Propagating either twice would double-count this one attacker
-            // against its victims' counts.
-            let first_defeat = !node.defeat_propagated(victim);
-            let first_known = !node.known_defeated(victim);
-            if !first_defeat && !first_known {
-                continue;
-            }
-            if first_defeat {
-                node.mark_defeat_propagated(victim);
-            }
-            if first_known {
-                node.mark_known_defeated(victim);
-            }
-            // `victim` conflicts with the set now, so it is no longer
-            // available as anyone's defender. This subtracts it from its
-            // own victims' counts; the loop below then reacts to whichever
-            // of those counts became critical.
-            let first_removal = node.is_usable_defender(victim);
-            node.remove_as_defender(af, victim);
-
-            for &victim_of_victim in af.victims(victim) {
-                // No already-in-the-set guard here: the flags above already
-                // ensure each real attacker of victim_of_victim contributes
-                // at most one decrement to each counter (deduplicated per
-                // attacker, not per target), so neither can be called more
-                // times than victim_of_victim's original attacker count --
-                // including for forced/seeded arguments, whose counts must
-                // keep being updated after they're already in the set.
-                if first_defeat {
-                    node.decrement_unattacked_attackers(victim_of_victim);
+pub fn propagate(mut queue: Vec<Lit>, node: &mut Node, af: &AF) -> bool {
+    let mut head = 0;
+    while head < queue.len() {
+        let lit = queue[head];
+        head += 1;
+        match lit {
+            Lit::In(m) => {
+                for &v in af.victims(m) {
+                    // A member attacks `v`, so it is actually defeated by the
+                    // set so far, which is what the defended-check used by
+                    // is_self_defending and candidates counts. Propagated at
+                    // most once per defeated argument, however many members
+                    // attack it, so that one attacker is never counted twice.
+                    if !node.defeat_propagated(v) {
+                        node.mark_defeat_propagated(v);
+                        for &w in af.victims(v) {
+                            node.decrement_unattacked_attackers(w);
+                        }
+                    }
+                    // Semi-complete: `v` conflicts with the set and is
+                    // defeated in every completion.
+                    if !set_out(v, Reason::Member, node, &mut queue) {
+                        return false;
+                    }
+                    set_def(v, node, &mut queue);
                 }
-                if first_known
-                    && node.decrement_undefeated_attackers(victim_of_victim) == 0
-                {
-                    if node.conflicts_with(af, victim_of_victim)
-                        || node.is_out(victim_of_victim)
+                for &b in af.attackers(m) {
+                    // Quasi-complete: `b` conflicts with the set, and any
+                    // completion must defend `m` by attacking `b` back.
+                    if !set_out(b, Reason::Member, node, &mut queue) {
+                        return false;
+                    }
+                    set_def(b, node, &mut queue);
+                }
+            }
+            Lit::Out(c) => {
+                // `c` can no longer defend anything it attacks.
+                for &v in af.victims(c) {
+                    node.decrement_usable_defenders(v);
+                    if !resolve_defenders(v, node, af, &mut queue) {
+                        return false;
+                    }
+                }
+            }
+            Lit::Def(b) => {
+                // One more attacker of each of `b`'s victims is defeated in
+                // every completion; a victim with none left must be in.
+                for &v in af.victims(b) {
+                    if node.decrement_undefeated_attackers(v) == 0
+                        && !set_in(v, Reason::Completeness, node, &mut queue)
                     {
                         return false;
                     }
-                    node.add_argument(victim_of_victim);
-                    update.push(victim_of_victim);
                 }
-                if first_removal
-                    && !resolve_defenders(victim_of_victim, node, af, &mut update)
-                {
+                // `b` must be defeated, so the set needs a defender against it.
+                if !resolve_defenders(b, node, af, &mut queue) {
                     return false;
                 }
             }
         }
-        // --- end: semi-complete closure ---
-
-        // --- begin: quasi-complete closure ---
-        for &attacker in af.attackers(arg) {
-            // `attacker` attacks a member of the set. A complete extension
-            // must defend its members, so any completion attacks `attacker`
-            // back: it too is defeated in every completion. That is the same
-            // fact the semi-complete rule above establishes by the other
-            // route, so it shares the flag -- whichever route reaches an
-            // argument first, the second must not decrement again.
-            if node.known_defeated(attacker) {
-                continue;
-            }
-            node.mark_known_defeated(attacker);
-            let first_removal = node.is_usable_defender(attacker);
-            node.remove_as_defender(af, attacker);
-
-            // --- begin: single-attacker (P-pseudo-complete) optimization ---
-            // Section 4.2 of the paper: if the set has exactly one
-            // remaining way to defend itself against `attacker`, that
-            // defender is forced -- there is no alternative to branch on.
-            // With no way left at all, the branch is dead. Driven off the
-            // maintained count rather than recomputed here, so it keeps
-            // firing as later additions shrink the choice, not only at the
-            // moment `attacker` is discovered.
-            if !resolve_defenders(attacker, node, af, &mut update) {
-                return false;
-            }
-            // --- end: single-attacker (P-pseudo-complete) optimization ---
-
-            for &co_victim in af.victims(attacker) {
-                if node.decrement_undefeated_attackers(co_victim) == 0 {
-                    if node.conflicts_with(af, co_victim)
-                        || node.is_out(co_victim)
-                    {
-                        return false;
-                    }
-                    node.add_argument(co_victim);
-                    update.push(co_victim);
-                }
-                if first_removal && !resolve_defenders(co_victim, node, af, &mut update) {
-                    return false;
-                }
-            }
-        }
-        // --- end: quasi-complete closure ---
     }
     true
+}
+
+/// Put the `seeds` in `node`'s set as assumptions and extend it with its
+/// smallest pseudo-complete superset; see `propagate`.
+///
+/// Returns `false` if that runs into a conflict, leaving `node` in a
+/// discarded, no-longer-meaningful state.
+#[must_use]
+pub fn pseudo_complete(seeds: Vec<usize>, node: &mut Node, af: &AF) -> bool {
+    let mut queue = Vec::with_capacity(seeds.len());
+    for arg in seeds {
+        if !set_in(arg, Reason::Decision, node, &mut queue) {
+            return false;
+        }
+    }
+    propagate(queue, node, af)
+}
+
+/// Rule `arg` out of `node`'s set, and of every node derived from it, and
+/// propagate the consequences. Used when a candidate's whole subtree has
+/// failed: it must never come back, not even as a side effect of some
+/// other candidate's closure.
+///
+/// Returns `false` if that runs into a conflict, leaving `node` in a
+/// discarded, no-longer-meaningful state.
+#[must_use]
+pub fn rule_out(arg: usize, node: &mut Node, af: &AF) -> bool {
+    let mut queue = Vec::new();
+    if !set_out(arg, Reason::RuledOut, node, &mut queue) {
+        return false;
+    }
+    propagate(queue, node, af)
 }
 
 #[cfg(test)]
@@ -203,6 +198,88 @@ mod tests {
     use super::*;
     use std::fs::File;
     use crate::io::af_parser::read_af;
+    use crate::algorithms::random_af::{random_af, Rng};
+
+    /// Check that every assignment in a node `propagate` has finished with
+    /// is justified by its recorded reason, and that the node is a fixpoint
+    /// of the closure rules.
+    fn check_node(node: &Node, af: &AF) {
+        for a in 0..af.argument_count() {
+            match (node.value(a), node.reason(a)) {
+                (Value::Undecided, _) => {}
+                (Value::In, Reason::Decision) => {}
+                (Value::In, Reason::Completeness) => assert!(
+                    af.attackers(a).all(|&b| node.known_defeated(b)),
+                    "{a} is in by completeness with an attacker not known defeated"
+                ),
+                (Value::In, Reason::OnlyDefender) => assert!(
+                    af.victims(a).any(|&b| node.known_defeated(b)
+                        && af.attackers(b).all(|&c| c == a || node.is_out(c))),
+                    "{a} is not the only defender left against anything it attacks"
+                ),
+                (Value::Out, Reason::SelfAttack) => assert!(af.attacks(a, a)),
+                (Value::Out, Reason::RuledOut) => {}
+                (Value::Out, Reason::Member) => assert!(
+                    node.is_defeated(af, a) || af.victims(a).any(|&v| node.contains(v)),
+                    "{a} is out for conflicting with the set, but does not"
+                ),
+                (value, reason) => panic!("{a} is {value:?} for {reason:?}"),
+            }
+            if node.known_defeated(a) {
+                assert!(
+                    node.is_defeated(af, a) || af.victims(a).any(|&v| node.contains(v)),
+                    "{a} is known defeated without attacking or being attacked by the set"
+                );
+                assert!(node.is_out(a), "{a} is known defeated but not out");
+            }
+
+            // Fixpoint: conflict-free, closed under the completeness rule,
+            // and every argument that must be defeated either is or still
+            // has a choice of defenders.
+            if node.contains(a) {
+                assert!(!node.is_defeated(af, a), "{a} is in and attacked by the set");
+            }
+            if af.attackers(a).all(|&b| node.known_defeated(b)) {
+                assert!(node.contains(a), "{a} is defended in every completion but not in");
+            }
+            if node.known_defeated(a) && !node.is_defeated(af, a) {
+                let usable = af.attackers(a).filter(|&&c| !node.is_out(c)).count();
+                assert!(usable >= 2, "{a} has {usable} usable defenders but was not resolved");
+            }
+        }
+    }
+
+    // Every assignment the closure makes, on random frameworks seeded the
+    // way dc_co seeds them and then with a further argument ruled out, is
+    // justified by its reason, and the result is a fixpoint.
+    #[test]
+    fn test_propagate_reasons_random() {
+        let mut rng = Rng::new(1);
+        let mut checked = 0;
+        for _ in 0..2000 {
+            let n = 2 + rng.below(11);
+            let percent = [10, 20, 35, 50][rng.below(4)];
+            let af = random_af(&mut rng, n, percent);
+            let mut node = Node::new(&af);
+            let mut seeds = vec![rng.below(n)];
+            seeds.extend((0..n).filter(|&a| af.attacker_count(a) == 0));
+            if !pseudo_complete(seeds, &mut node, &af) {
+                continue;
+            }
+            check_node(&node, &af);
+            checked += 1;
+            let undecided: Vec<usize> = (0..n)
+                .filter(|&a| node.value(a) == Value::Undecided)
+                .collect();
+            if !undecided.is_empty() {
+                let c = undecided[rng.below(undecided.len())];
+                if rule_out(c, &mut node, &af) {
+                    check_node(&node, &af);
+                }
+            }
+        }
+        assert!(checked > 500, "too few consistent closures ({checked}) to mean much");
+    }
 
     // Chain 0 -> 1 -> 2 -> 3: only 0 and 2 belong to the grounded/complete closure
     fn build_af() -> AF {
@@ -236,7 +313,7 @@ mod tests {
         let af = read_af(input_af);
         let mut node = Node::new(&af);
 
-        // Seed the update stack the way a real caller would: with the
+        // Seed the closure the way a real caller would: with the
         // arguments that are unconditionally defended from the start.
         let mut update = Vec::new();
         for arg in 0..af.argument_count() {
@@ -314,16 +391,16 @@ mod tests {
     }
 
     // 0 -> 1 -> 2: forcing 0 in organically pulls in 2 (via 1's defeat), with
-    // no direct conflict. If 2 is already a known-prohibited candidate (e.g.
+    // no direct conflict. If 2 has already been ruled out (e.g.
     // a previously-failed search hypothesis), the closure must still reject
-    // it, even though nothing here would trip conflicts_with on its own.
+    // it, even though 2 does not conflict with anything in the set.
     #[test]
-    fn test_pseudo_complete_prohibited_candidate() {
+    fn test_pseudo_complete_ruled_out() {
         let mut af = AF::new(3);
         af.add_attack(0, 1);
         af.add_attack(1, 2);
         let mut node = Node::new(&af);
-        node.rule_out(&af, 2);
+        assert!(rule_out(2, &mut node, &af));
 
         assert!(!pseudo_complete(vec![0], &mut node, &af));
     }

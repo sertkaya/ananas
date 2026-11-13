@@ -1,39 +1,33 @@
 use std::collections::HashSet;
 use crate::af::AF;
-use crate::algorithms::closure::pseudo_complete;
-use crate::algorithms::node::Node;
+use crate::algorithms::closure::{pseudo_complete, rule_out};
+use crate::algorithms::node::{Node, Value};
 
 /// A node of the search tree paired with the candidate arguments still to
-/// be tried, lazily, for defeating its most constrained undefeated attacker,
-/// and the arguments already known (from earlier failed candidates tried at
-/// or above this point) to be unsuitable for this branch.
+/// be tried, lazily, for defeating its most constrained undefeated attacker.
+/// The arguments already known (from earlier failed candidates tried at or
+/// above this point) to be unsuitable for this branch are out in the node.
 struct Frame {
     node: Node,
     candidates: Vec<usize>,
     // The candidate whose subtree we just pushed on top of this frame, if
     // any. If this frame is popped again while this is set, that subtree
     // must have failed entirely without success (a success would have
-    // returned from the whole search already), so the candidate belongs in
-    // prohibited_candidates before we try anything else from this frame.
+    // returned from the whole search already), so the candidate is ruled
+    // out of the node before we try anything else from this frame.
     pending_candidate: Option<usize>,
 }
 
 /// Among `node`'s undefended members' undefeated attackers, find the one
 /// with the fewest usable attackers of its own -- the most constrained
 /// argument to defeat -- and return those attackers as the candidates to
-/// try defeating it with. A candidate is usable when it is not already
-/// decided, not in `prohibited_candidates`, and does not conflict with the
-/// set; that is the candidate set `C ⊆ A \ (R(S) ∪ R⁻¹(S) ∪ P)` of the
-/// paper's Algorithm 1, and the same predicate has to be used for the
-/// counting, since selecting the smallest candidate set is only meaningful
-/// if unusable candidates are excluded from the counts too.
-///
-/// Conflicting arguments need no scan to find: `Node::known_defeated` is
-/// set exactly for `R(S)` by the semi-complete loop and for `R⁻¹(S)` by the
-/// quasi-complete loop, so once `pseudo_complete` has returned it *is*
-/// `R(S) ∪ R⁻¹(S)`. Only the self-attackers have to be supplied separately,
-/// in `self_attacking`, since they are a property of the framework rather
-/// than of the node (the paper puts them in the initial `P` instead).
+/// try defeating it with. A candidate is usable when it is still
+/// undecided; that is the candidate set `C ⊆ A \ (R(S) ∪ R⁻¹(S) ∪ P)` of
+/// the paper's Algorithm 1, since once `pseudo_complete` has returned the
+/// out arguments are exactly the ones that conflict with the set, attack
+/// themselves, or have been ruled out. The same predicate has to be used
+/// for the counting, since selecting the smallest candidate set is only
+/// meaningful if unusable candidates are excluded from the counts too.
 ///
 /// Candidates are ordered so that the one with the fewest attackers of its
 /// own (hence the least likely to trigger further branching) is tried
@@ -46,10 +40,8 @@ struct Frame {
 ///
 /// `node` must not be self-defending, i.e. some member must have an
 /// undefeated attacker.
-fn candidates(node: &Node, af: &AF, self_attacking: &[bool]) -> Vec<usize> {
-    let usable = |c: usize| {
-        !node.is_out(c) && !node.known_defeated(c) && !self_attacking[c]
-    };
+fn candidates(node: &Node, af: &AF) -> Vec<usize> {
+    let usable = |c: usize| node.value(c) == Value::Undecided;
 
     let mut best_attacker: Option<usize> = None;
     let mut best_count = usize::MAX;
@@ -139,26 +131,20 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     // misses.
     let mut empty_candidate_lists: usize = 0;
 
-    // Self-attacking arguments can never belong to a conflict-free set, so
-    // they are never usable candidates. This depends only on the framework,
-    // not on the search state, so it is computed once here rather than per
-    // node (the paper folds it into the initial prohibited set instead).
-    let self_attacking: Vec<bool> = (0..af.argument_count()).map(|a| af.attacks(a, a)).collect();
-
     let mut current_node = Node::new(af);
 
     // We hypothesize that `arg` is in the extension, and arguments with no
-    // attackers are defended by default, so both go onto the update stack;
-    // pseudo_complete adds them to `current_node` before propagating their effects.
-    let mut update = vec![arg];
+    // attackers are defended by default, so both are seeds; pseudo_complete
+    // adds them to `current_node` before propagating their effects.
+    let mut seeds = vec![arg];
     for a in 0..af.argument_count() {
         if af.attacker_count(a) == 0 {
-            update.push(a);
+            seeds.push(a);
         }
     }
 
     pseudo_complete_calls += 1;
-    if !pseudo_complete(update, &mut current_node, af) {
+    if !pseudo_complete(seeds, &mut current_node, af) {
         // The hypothesis that `arg` is in the extension is already
         // contradictory: closing it produced a conflict.
         if verbose {
@@ -179,7 +165,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     }
 
     if current_node.is_self_defending() {
-        // node_args is conflict-free (checked above) and closed under
+        // The set is conflict-free (checked above) and closed under
         // defense (guaranteed by pseudo_complete), and now every argument
         // in it defends itself: that's exactly a complete extension.
         if verbose {
@@ -199,7 +185,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         return Some(current_node.arguments());
     }
 
-    let root_candidates = candidates(&current_node, af, &self_attacking);
+    let root_candidates = candidates(&current_node, af);
     if root_candidates.is_empty() {
         empty_candidate_lists += 1;
     }
@@ -235,8 +221,13 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // pending_candidate's doc comment): it must never be retried in
         // this branch, even as a side effect of a different candidate's
         // closure.
-        if let Some(failed) = frame.pending_candidate.take() {
-            frame.node.rule_out(af, failed);
+        // If ruling it out leaves the node itself contradictory, no
+        // remaining candidate can succeed from here either, so the whole
+        // frame fails at once instead of sibling by sibling.
+        if let Some(failed) = frame.pending_candidate.take()
+            && !rule_out(failed, &mut frame.node, af)
+        {
+            continue;
         }
 
         // Take just one untried candidate; leave the rest for later, so a
@@ -275,7 +266,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                 }
                 return Some(child.arguments());
             }
-            let child_candidates = candidates(&child, af, &self_attacking);
+            let child_candidates = candidates(&child, af);
             if child_candidates.is_empty() {
                 empty_candidate_lists += 1;
             }
@@ -311,6 +302,35 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::algorithms::random_af::{random_af, Rng};
+
+    // dc_co agrees with brute force on random small frameworks: it answers
+    // YES exactly when some complete extension contains the argument, and
+    // the extension it returns is complete and contains it.
+    #[test]
+    fn test_dc_co_matches_brute_force() {
+        let mut rng = Rng::new(2);
+        for round in 0..400 {
+            let n = 2 + rng.below(9);
+            let percent = [10, 20, 35, 50][rng.below(4)];
+            let af = random_af(&mut rng, n, percent);
+            let complete: Vec<HashSet<usize>> = (0..1u32 << n)
+                .map(|bits| (0..n).filter(|&a| bits & (1 << a) != 0).collect())
+                .filter(|set| af.is_complete(set))
+                .collect();
+            for arg in 0..n {
+                let expected = complete.iter().any(|set| set.contains(&arg));
+                match dc_co(&af, arg, false) {
+                    Some(extension) => {
+                        assert!(expected, "round {round}, arg {arg}: YES, but no complete extension contains it\n{af}");
+                        assert!(extension.contains(&arg) && af.is_complete(&extension),
+                            "round {round}, arg {arg}: returned {extension:?}, not a complete extension containing it\n{af}");
+                    }
+                    None => assert!(!expected, "round {round}, arg {arg}: NO, but a complete extension contains it\n{af}"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn test_dc_co_trivial() {
@@ -364,11 +384,10 @@ mod tests {
         af.add_attack(3, 1);
         af.add_attack(4, 1);
         let mut node = Node::new(&af);
-        node.rule_out(&af, 4);
+        assert!(rule_out(4, &mut node, &af));
         assert!(pseudo_complete(vec![0], &mut node, &af));
 
-        let self_attacking = vec![false; af.argument_count()];
-        let result = candidates(&node, &af, &self_attacking);
+        let result = candidates(&node, &af);
         assert!(!result.contains(&4), "4 was ruled out for this branch");
         // Both survivors are unattacked, so they tie on attacker count and
         // order by id -- reversed, since the search pops from the back.
@@ -393,8 +412,7 @@ mod tests {
         let mut node = Node::new(&af);
         assert!(pseudo_complete(vec![0], &mut node, &af));
 
-        let self_attacking = vec![false; af.argument_count()];
-        let result = candidates(&node, &af, &self_attacking);
+        let result = candidates(&node, &af);
         assert!(!result.contains(&2), "2 is attacked by the set, so it can never be added");
         // Both remaining candidates are unattacked, so they tie on attacker
         // count and order by id -- reversed, since the search pops from the back.
