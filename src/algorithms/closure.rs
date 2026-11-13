@@ -1,41 +1,18 @@
 use crate::af::AF;
 use crate::algorithms::node::{Assignment, Lit, Node, Reason, Value};
 
-/// Put `arg` in the set for `reason`, queueing it for propagation if that
-/// is new. Returns `false` if `arg` is already out.
+/// Put `arg` in the set for `reason`. Returns `false` if `arg` is already
+/// out.
 #[must_use]
-fn set_in(arg: usize, reason: Reason, node: &mut Node, queue: &mut Vec<Lit>) -> bool {
-    match node.assign(arg, Value::In, reason) {
-        Assignment::New => {
-            queue.push(Lit::In(arg));
-            true
-        }
-        Assignment::Unchanged => true,
-        Assignment::Conflict => false,
-    }
+fn set_in(arg: usize, reason: Reason, node: &mut Node) -> bool {
+    node.assign(arg, Value::In, reason) != Assignment::Conflict
 }
 
-/// Rule `arg` out of the set for `reason`, queueing that for propagation if
-/// it is new. Returns `false` if `arg` is already in.
+/// Rule `arg` out of the set for `reason`. Returns `false` if `arg` is
+/// already in.
 #[must_use]
-fn set_out(arg: usize, reason: Reason, node: &mut Node, queue: &mut Vec<Lit>) -> bool {
-    match node.assign(arg, Value::Out, reason) {
-        Assignment::New => {
-            queue.push(Lit::Out(arg));
-            true
-        }
-        Assignment::Unchanged => true,
-        Assignment::Conflict => false,
-    }
-}
-
-/// Record that `arg` is defeated in every completion, queueing that for
-/// propagation if it is new. Cannot conflict: nothing ever records that an
-/// argument must stay undefeated.
-fn set_def(arg: usize, node: &mut Node, queue: &mut Vec<Lit>) {
-    if node.assign_def(arg) {
-        queue.push(Lit::Def(arg));
-    }
+fn set_out(arg: usize, reason: Reason, node: &mut Node) -> bool {
+    node.assign(arg, Value::Out, reason) != Assignment::Conflict
 }
 
 /// Check whether the set still has a way to defend itself against `b`,
@@ -53,7 +30,7 @@ fn set_def(arg: usize, node: &mut Node, queue: &mut Vec<Lit>) {
 ///
 /// Returns `false` if the branch is dead.
 #[must_use]
-fn resolve_defenders(b: usize, node: &mut Node, af: &AF, queue: &mut Vec<Lit>) -> bool {
+fn resolve_defenders(b: usize, node: &mut Node, af: &AF) -> bool {
     if !node.known_defeated(b) || node.usable_defenders_count(b) > 1 {
         // Either nothing demands that `b` be defeated, or there is still a
         // choice of defenders: a flag and an array read, and nothing is
@@ -68,12 +45,74 @@ fn resolve_defenders(b: usize, node: &mut Node, af: &AF, queue: &mut Vec<Lit>) -
     // them from above.
     match af.attackers(b).copied().find(|&c| !node.is_out(c)) {
         None => false,
-        Some(survivor) => set_in(survivor, Reason::OnlyDefender, node, queue),
+        Some(survivor) => set_in(survivor, Reason::OnlyDefender, node),
     }
 }
 
-/// Propagate the consequences of the assignments in `queue` until nothing
-/// more follows, extending `node` to its smallest pseudo-complete superset.
+/// Apply what propagating `lit` does to the node's counters. Done for the
+/// whole of a literal before any assignment it triggers, so that a
+/// conflict never leaves a literal's counter updates half done, and
+/// `unapply` can reverse them exactly.
+fn apply(lit: Lit, node: &mut Node, af: &AF) {
+    match lit {
+        Lit::In(m) => {
+            // A member attacks each victim, so it is actually defeated by
+            // the set so far, which is what the defended-check used by
+            // is_self_defending and candidates counts. Propagated with the
+            // first member that attacks it, so that one defeated attacker
+            // is never counted twice.
+            for &v in af.victims(m) {
+                if node.add_in_attacker(v) {
+                    for &w in af.victims(v) {
+                        node.decrement_unattacked_attackers(w);
+                    }
+                }
+            }
+        }
+        Lit::Out(c) => {
+            // `c` can no longer defend anything it attacks.
+            for &v in af.victims(c) {
+                node.decrement_usable_defenders(v);
+            }
+        }
+        Lit::Def(b) => {
+            // One more attacker of each of `b`'s victims is defeated in
+            // every completion.
+            for &v in af.victims(b) {
+                node.decrement_undefeated_attackers(v);
+            }
+        }
+    }
+}
+
+/// Reverse what `apply` did to the node's counters for `lit`
+fn unapply(lit: Lit, node: &mut Node, af: &AF) {
+    match lit {
+        Lit::In(m) => {
+            for &v in af.victims(m) {
+                if node.remove_in_attacker(v) {
+                    for &w in af.victims(v) {
+                        node.increment_unattacked_attackers(w);
+                    }
+                }
+            }
+        }
+        Lit::Out(c) => {
+            for &v in af.victims(c) {
+                node.increment_usable_defenders(v);
+            }
+        }
+        Lit::Def(b) => {
+            for &v in af.victims(b) {
+                node.increment_undefeated_attackers(v);
+            }
+        }
+    }
+}
+
+/// Propagate the consequences of the assignments queued on `node`'s trail
+/// until nothing more follows, extending `node` to its smallest
+/// pseudo-complete superset.
 ///
 /// Both closure rules rest on the same observation: an argument `b` is
 /// defeated in *every* complete extension containing `node`'s current
@@ -89,70 +128,55 @@ fn resolve_defenders(b: usize, node: &mut Node, af: &AF, queue: &mut Vec<Lit>) -
 /// none the branch is dead.
 ///
 /// Every assignment is made eagerly, the moment it follows, and is only
-/// propagated later, in queue order; so an argument's value is exact even
+/// propagated later, in trail order; so an argument's value is exact even
 /// while the counters derived from it are catching up.
 ///
 /// Returns `false` as soon as an argument would have to be both in and
-/// out, or would have to be defeated with no way left to defeat it,
-/// leaving `node` in a discarded, no-longer-meaningful state. Returns
-/// `true` if the closure completed without any conflict.
+/// out, or would have to be defeated with no way left to defeat it. The
+/// node is then contradictory, and must be backtracked to before whatever
+/// assignment was being propagated.
 #[must_use]
-pub fn propagate(mut queue: Vec<Lit>, node: &mut Node, af: &AF) -> bool {
-    let mut head = 0;
-    while head < queue.len() {
-        let lit = queue[head];
-        head += 1;
+pub fn propagate(node: &mut Node, af: &AF) -> bool {
+    while let Some(lit) = node.next_to_propagate() {
+        apply(lit, node, af);
         match lit {
             Lit::In(m) => {
                 for &v in af.victims(m) {
-                    // A member attacks `v`, so it is actually defeated by the
-                    // set so far, which is what the defended-check used by
-                    // is_self_defending and candidates counts. Propagated at
-                    // most once per defeated argument, however many members
-                    // attack it, so that one attacker is never counted twice.
-                    if !node.defeat_propagated(v) {
-                        node.mark_defeat_propagated(v);
-                        for &w in af.victims(v) {
-                            node.decrement_unattacked_attackers(w);
-                        }
-                    }
                     // Semi-complete: `v` conflicts with the set and is
                     // defeated in every completion.
-                    if !set_out(v, Reason::Member, node, &mut queue) {
+                    if !set_out(v, Reason::Member, node) {
                         return false;
                     }
-                    set_def(v, node, &mut queue);
+                    node.assign_def(v);
                 }
                 for &b in af.attackers(m) {
                     // Quasi-complete: `b` conflicts with the set, and any
                     // completion must defend `m` by attacking `b` back.
-                    if !set_out(b, Reason::Member, node, &mut queue) {
+                    if !set_out(b, Reason::Member, node) {
                         return false;
                     }
-                    set_def(b, node, &mut queue);
+                    node.assign_def(b);
                 }
             }
             Lit::Out(c) => {
-                // `c` can no longer defend anything it attacks.
                 for &v in af.victims(c) {
-                    node.decrement_usable_defenders(v);
-                    if !resolve_defenders(v, node, af, &mut queue) {
+                    if !resolve_defenders(v, node, af) {
                         return false;
                     }
                 }
             }
             Lit::Def(b) => {
-                // One more attacker of each of `b`'s victims is defeated in
-                // every completion; a victim with none left must be in.
+                // A victim of `b` with no attacker left that is not known
+                // defeated is defended in every completion, so must be in.
                 for &v in af.victims(b) {
-                    if node.decrement_undefeated_attackers(v) == 0
-                        && !set_in(v, Reason::Completeness, node, &mut queue)
+                    if node.undefeated_attackers_count(v) == 0
+                        && !set_in(v, Reason::Completeness, node)
                     {
                         return false;
                     }
                 }
                 // `b` must be defeated, so the set needs a defender against it.
-                if !resolve_defenders(b, node, af, &mut queue) {
+                if !resolve_defenders(b, node, af) {
                     return false;
                 }
             }
@@ -161,36 +185,44 @@ pub fn propagate(mut queue: Vec<Lit>, node: &mut Node, af: &AF) -> bool {
     true
 }
 
+/// Undo every assignment made after the trail was `len` long, reversing
+/// their effect on the counters, so that `node` is exactly as it was then.
+pub fn backtrack(len: usize, node: &mut Node, af: &AF) {
+    while let Some((lit, was_propagated)) = node.unassign_last(len) {
+        if was_propagated {
+            unapply(lit, node, af);
+        }
+    }
+}
+
 /// Put the `seeds` in `node`'s set as assumptions and extend it with its
 /// smallest pseudo-complete superset; see `propagate`.
 ///
-/// Returns `false` if that runs into a conflict, leaving `node` in a
-/// discarded, no-longer-meaningful state.
+/// Returns `false` if that runs into a conflict, leaving `node`
+/// contradictory until it is backtracked to before the seeds.
 #[must_use]
 pub fn pseudo_complete(seeds: Vec<usize>, node: &mut Node, af: &AF) -> bool {
-    let mut queue = Vec::with_capacity(seeds.len());
     for arg in seeds {
-        if !set_in(arg, Reason::Decision, node, &mut queue) {
+        if !set_in(arg, Reason::Decision, node) {
             return false;
         }
     }
-    propagate(queue, node, af)
+    propagate(node, af)
 }
 
-/// Rule `arg` out of `node`'s set, and of every node derived from it, and
-/// propagate the consequences. Used when a candidate's whole subtree has
-/// failed: it must never come back, not even as a side effect of some
-/// other candidate's closure.
+/// Rule `arg` out of `node`'s set, and propagate the consequences. Used
+/// when a candidate's whole subtree has failed: it must never come back in
+/// this branch, not even as a side effect of some other candidate's
+/// closure.
 ///
-/// Returns `false` if that runs into a conflict, leaving `node` in a
-/// discarded, no-longer-meaningful state.
+/// Returns `false` if that runs into a conflict, leaving `node`
+/// contradictory until it is backtracked to before the ruling-out.
 #[must_use]
 pub fn rule_out(arg: usize, node: &mut Node, af: &AF) -> bool {
-    let mut queue = Vec::new();
-    if !set_out(arg, Reason::RuledOut, node, &mut queue) {
+    if !set_out(arg, Reason::RuledOut, node) {
         return false;
     }
-    propagate(queue, node, af)
+    propagate(node, af)
 }
 
 #[cfg(test)]
@@ -247,6 +279,52 @@ mod tests {
                 assert!(usable >= 2, "{a} has {usable} usable defenders but was not resolved");
             }
         }
+    }
+
+    // Backtracking restores the node exactly -- values, counters, trail --
+    // after any mix of decisions and ruling-outs on random frameworks,
+    // including ones that ended in a conflict partway through propagating.
+    #[test]
+    fn test_backtrack_restores_state_random() {
+        let mut rng = Rng::new(3);
+        let mut conflicts = 0;
+        for _ in 0..2000 {
+            let n = 2 + rng.below(11);
+            let percent = [10, 20, 35, 50][rng.below(4)];
+            let af = random_af(&mut rng, n, percent);
+            let mut node = Node::new(&af);
+            let mut seeds = vec![rng.below(n)];
+            seeds.extend((0..n).filter(|&a| af.attacker_count(a) == 0));
+            if !pseudo_complete(seeds, &mut node, &af) {
+                conflicts += 1;
+                backtrack(0, &mut node, &af);
+                node.assert_same_state(&Node::new(&af));
+                continue;
+            }
+            let snapshot = node.clone();
+            let mark = node.trail_len();
+            for _ in 0..1 + rng.below(3) {
+                let undecided: Vec<usize> = (0..n)
+                    .filter(|&a| node.value(a) == Value::Undecided)
+                    .collect();
+                if undecided.is_empty() {
+                    break;
+                }
+                let c = undecided[rng.below(undecided.len())];
+                let consistent = if rng.below(2) == 0 {
+                    pseudo_complete(vec![c], &mut node, &af)
+                } else {
+                    rule_out(c, &mut node, &af)
+                };
+                if !consistent {
+                    conflicts += 1;
+                    break;
+                }
+            }
+            backtrack(mark, &mut node, &af);
+            node.assert_same_state(&snapshot);
+        }
+        assert!(conflicts > 200, "too few conflicts ({conflicts}) to test undoing them");
     }
 
     // Every assignment the closure makes, on random frameworks seeded the

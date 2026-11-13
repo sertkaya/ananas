@@ -1,14 +1,17 @@
 use std::collections::HashSet;
 use crate::af::AF;
-use crate::algorithms::closure::{pseudo_complete, rule_out};
+use crate::algorithms::closure::{backtrack, pseudo_complete, rule_out};
 use crate::algorithms::node::{Node, Value};
 
-/// A node of the search tree paired with the candidate arguments still to
-/// be tried, lazily, for defeating its most constrained undefeated attacker.
-/// The arguments already known (from earlier failed candidates tried at or
-/// above this point) to be unsuitable for this branch are out in the node.
+/// A node of the search tree: where its assignments start on the search's
+/// trail, and the candidate arguments still to be tried, lazily, for
+/// defeating its most constrained undefeated attacker. The arguments
+/// already known (from earlier failed candidates tried at or above this
+/// point) to be unsuitable for this branch are out on the trail.
 struct Frame {
-    node: Node,
+    // Length of the trail before this frame's own decision, so that
+    // backtracking to it undoes the frame entirely
+    start: usize,
     candidates: Vec<usize>,
     // The candidate whose subtree we just pushed on top of this frame, if
     // any. If this frame is popped again while this is set, that subtree
@@ -32,11 +35,9 @@ struct Frame {
 /// Candidates are ordered so that the one with the fewest attackers of its
 /// own (hence the least likely to trigger further branching) is tried
 /// first, with ties broken by argument id. Both the search over undefeated
-/// attackers and this ordering are made fully deterministic on purpose:
-/// af.attackers()/af.victims() iterate a HashSet, whose order depends on
-/// Rust's per-process randomized hash seed, so leaving either choice to
-/// that order would make the amount of search work done for the exact same
-/// query vary randomly from run to run.
+/// attackers and this ordering break ties explicitly by id rather than
+/// leaving them to adjacency order, so that the amount of search work done
+/// for a query does not depend on how the framework happens to be stored.
 ///
 /// `node` must not be self-defending, i.e. some member must have an
 /// undefeated attacker.
@@ -131,11 +132,11 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     // misses.
     let mut empty_candidate_lists: usize = 0;
 
-    let mut current_node = Node::new(af);
+    let mut node = Node::new(af);
 
     // We hypothesize that `arg` is in the extension, and arguments with no
     // attackers are defended by default, so both are seeds; pseudo_complete
-    // adds them to `current_node` before propagating their effects.
+    // adds them to `node` before propagating their effects.
     let mut seeds = vec![arg];
     for a in 0..af.argument_count() {
         if af.attacker_count(a) == 0 {
@@ -144,7 +145,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     }
 
     pseudo_complete_calls += 1;
-    if !pseudo_complete(seeds, &mut current_node, af) {
+    if !pseudo_complete(seeds, &mut node, af) {
         // The hypothesis that `arg` is in the extension is already
         // contradictory: closing it produced a conflict.
         if verbose {
@@ -164,7 +165,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         return None;
     }
 
-    if current_node.is_self_defending() {
+    if node.is_self_defending() {
         // The set is conflict-free (checked above) and closed under
         // defense (guaranteed by pseudo_complete), and now every argument
         // in it defends itself: that's exactly a complete extension.
@@ -182,10 +183,10 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                 )
             );
         }
-        return Some(current_node.arguments());
+        return Some(node.arguments());
     }
 
-    let root_candidates = candidates(&current_node, af);
+    let root_candidates = candidates(&node, af);
     if root_candidates.is_empty() {
         empty_candidate_lists += 1;
     }
@@ -194,7 +195,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
     candidate_count_max = candidate_count_max.max(root_candidates.len());
     candidate_count_min = candidate_count_min.min(root_candidates.len());
     let mut stack: Vec<Frame> = vec![Frame {
-        node: current_node,
+        start: 0,
         candidates: root_candidates,
         pending_candidate: None,
     }];
@@ -224,9 +225,11 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // If ruling it out leaves the node itself contradictory, no
         // remaining candidate can succeed from here either, so the whole
         // frame fails at once instead of sibling by sibling.
+        // Either way the frame is then done with, and is undone.
         if let Some(failed) = frame.pending_candidate.take()
-            && !rule_out(failed, &mut frame.node, af)
+            && !rule_out(failed, &mut node, af)
         {
+            backtrack(frame.start, &mut node, af);
             continue;
         }
 
@@ -234,12 +237,9 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // sibling is only ever generated once this candidate's whole
         // subtree has been fully explored and abandoned.
         let Some(c) = frame.candidates.pop() else {
+            backtrack(frame.start, &mut node, af);
             continue;
         };
-
-        // The out-set rides along inside the node, so this one clone
-        // carries the whole partial assignment to the child.
-        let mut child = frame.node.clone();
 
         // Push this frame back before trying c, regardless of outcome: if c
         // fails immediately, we'll pop it again right away; if it needs a
@@ -247,9 +247,12 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         frame.pending_candidate = Some(c);
         stack.push(frame);
 
+        let child_start = node.trail_len();
         pseudo_complete_calls += 1;
-        if pseudo_complete(vec![c], &mut child, af) {
-            if child.is_self_defending() {
+        if !pseudo_complete(vec![c], &mut node, af) {
+            backtrack(child_start, &mut node, af);
+        } else {
+            if node.is_self_defending() {
                 if verbose {
                     eprintln!(
                 "[dc_co stats] {}",
@@ -264,9 +267,9 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
                 )
             );
                 }
-                return Some(child.arguments());
+                return Some(node.arguments());
             }
-            let child_candidates = candidates(&child, af);
+            let child_candidates = candidates(&node, af);
             if child_candidates.is_empty() {
                 empty_candidate_lists += 1;
             }
@@ -275,7 +278,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
             candidate_count_max = candidate_count_max.max(child_candidates.len());
             candidate_count_min = candidate_count_min.min(child_candidates.len());
             stack.push(Frame {
-                node: child,
+                start: child_start,
                 candidates: child_candidates,
                 pending_candidate: None,
             });

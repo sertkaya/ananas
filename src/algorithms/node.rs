@@ -61,7 +61,13 @@ pub enum Assignment {
     Conflict,
 }
 
-/// Node of the search tree
+/// The search's state: a partial assignment, the trail of assignments that
+/// built it, and the counters the closure rules derive from it.
+///
+/// There is one node per search, not one per search-tree node. Going deeper
+/// appends to the trail; backtracking pops the trail and reverses each
+/// popped assignment, so a search step costs the work it does rather than a
+/// copy of the whole state.
 #[derive(Debug, Clone)]
 pub struct Node {
     // The search's partial assignment: whether each argument is in the
@@ -75,9 +81,11 @@ pub struct Node {
     reason: Vec<Reason>,
     // Number of unattacked attackers for each argument
     unattacked_attackers_count: Vec<usize>,
-    // Whether an argument's defeat has already been propagated to its own
-    // victims' unattacked_attackers_count, indexed by argument id
-    defeat_propagated: Vec<bool>,
+    // Number of each argument's attackers whose being in has been
+    // propagated. Its going from 0 to 1 is the argument's defeat, which is
+    // what is propagated to its victims' unattacked_attackers_count; kept as
+    // a count rather than a flag so that undoing it is symmetric.
+    in_attackers_count: Vec<usize>,
     // Number of attackers of each argument not yet known to be defeated in
     // every completion of this node's set. An attacker counts as known
     // defeated either because a member of the set attacks it, or because it
@@ -86,8 +94,8 @@ pub struct Node {
     // defeated in any completion, so the argument is defended and must be in.
     undefeated_attackers_count: Vec<usize>,
     // Whether an argument is known to be defeated in every completion of
-    // this node's set, with that fact queued for propagation to its own
-    // victims' undefeated_attackers_count
+    // this node's set, with that fact on the trail for propagation to its
+    // own victims' undefeated_attackers_count
     known_defeated: Vec<bool>,
     // Number of each argument's attackers whose being out has not yet been
     // propagated. Never less than the number of attackers that could still
@@ -95,6 +103,12 @@ pub struct Node {
     // left to defend against it: reaching 1 may force that defender, and
     // reaching 0 kills the branch.
     usable_defenders_count: Vec<usize>,
+    // Every assignment, in the order it was made. The self-attackers are
+    // out from the start and are not on it.
+    trail: Vec<Lit>,
+    // How many assignments at the front of the trail have had their
+    // consequences propagated; the rest are still queued.
+    propagated: usize,
 }
 
 // Create a new node
@@ -114,7 +128,7 @@ impl Node {
         let unattacked_attackers_count = (0..af.argument_count())
             .map(|a| af.attacker_count(a))
             .collect();
-        let defeat_propagated = vec![false; af.argument_count()];
+        let in_attackers_count = vec![0; af.argument_count()];
         let undefeated_attackers_count = (0..af.argument_count())
             .map(|a| af.attacker_count(a))
             .collect();
@@ -126,10 +140,12 @@ impl Node {
             value,
             reason,
             unattacked_attackers_count,
-            defeat_propagated,
+            in_attackers_count,
             undefeated_attackers_count,
             known_defeated,
             usable_defenders_count,
+            trail: Vec::new(),
+            propagated: 0,
         }
     }
 
@@ -146,7 +162,8 @@ impl Node {
     }
 
     /// Assign a value, `Value::In` or `Value::Out`, to an argument, for the
-    /// given reason. A conflict leaves the node unchanged.
+    /// given reason, appending it to the trail if it is new. A conflict
+    /// leaves the node unchanged.
     pub fn assign(&mut self, arg: usize, value: Value, reason: Reason) -> Assignment {
         debug_assert!(value != Value::Undecided);
         if self.value[arg] == value {
@@ -156,8 +173,44 @@ impl Node {
         } else {
             self.value[arg] = value;
             self.reason[arg] = reason;
+            self.trail.push(match value {
+                Value::In => Lit::In(arg),
+                _ => Lit::Out(arg),
+            });
             Assignment::New
         }
+    }
+
+    /// Get the length of the trail, to backtrack to later
+    pub fn trail_len(&self) -> usize {
+        self.trail.len()
+    }
+
+    /// Take the next assignment whose consequences are still to be
+    /// propagated, counting it as propagated from now on
+    pub fn next_to_propagate(&mut self) -> Option<Lit> {
+        let lit = *self.trail.get(self.propagated)?;
+        self.propagated += 1;
+        Some(lit)
+    }
+
+    /// Undo the latest assignment, if the trail is longer than `len`.
+    /// Returns it, and whether it had been propagated -- if so, the caller
+    /// must reverse what propagating it did to the counters.
+    pub fn unassign_last(&mut self, len: usize) -> Option<(Lit, bool)> {
+        if self.trail.len() <= len {
+            return None;
+        }
+        let lit = self.trail.pop().expect("the trail is longer than len");
+        let was_propagated = self.trail.len() < self.propagated;
+        if was_propagated {
+            self.propagated = self.trail.len();
+        }
+        match lit {
+            Lit::In(a) | Lit::Out(a) => self.value[a] = Value::Undecided,
+            Lit::Def(a) => self.known_defeated[a] = false,
+        }
+        Some((lit, was_propagated))
     }
 
     /// Check whether an argument is part of this node's set of arguments
@@ -175,11 +228,14 @@ impl Node {
         self.unattacked_attackers_count[arg]
     }
 
-    /// Decrement the number of unattacked attackers of an argument and
-    /// return the new count
-    pub fn decrement_unattacked_attackers(&mut self, arg: usize) -> usize {
+    /// Decrement the number of unattacked attackers of an argument
+    pub fn decrement_unattacked_attackers(&mut self, arg: usize) {
         self.unattacked_attackers_count[arg] -= 1;
-        self.unattacked_attackers_count[arg]
+    }
+
+    /// Increment the number of unattacked attackers of an argument
+    pub fn increment_unattacked_attackers(&mut self, arg: usize) {
+        self.unattacked_attackers_count[arg] += 1;
     }
 
     /// Get the bound on the number of `arg`'s attackers that could still
@@ -189,11 +245,14 @@ impl Node {
         self.usable_defenders_count[arg]
     }
 
-    /// Decrement the usable-defender count of an argument and return the
-    /// new count
-    pub fn decrement_usable_defenders(&mut self, arg: usize) -> usize {
+    /// Decrement the usable-defender count of an argument
+    pub fn decrement_usable_defenders(&mut self, arg: usize) {
         self.usable_defenders_count[arg] -= 1;
-        self.usable_defenders_count[arg]
+    }
+
+    /// Increment the usable-defender count of an argument
+    pub fn increment_usable_defenders(&mut self, arg: usize) {
+        self.usable_defenders_count[arg] += 1;
     }
 
     /// Check whether `arg` is attacked by any argument already in this
@@ -205,21 +264,41 @@ impl Node {
     /// Check whether `arg`'s defeat has already been propagated to its own
     /// victims' unattacked_attackers_count. `arg` being defeated is a
     /// one-time fact regardless of how many of its attackers are accepted,
-    /// so this must only ever happen once.
+    /// so it is propagated with the first of them and undone with the last.
     pub fn defeat_propagated(&self, arg: usize) -> bool {
-        self.defeat_propagated[arg]
+        self.in_attackers_count[arg] > 0
     }
 
-    /// Mark `arg`'s defeat as having been propagated
-    pub fn mark_defeat_propagated(&mut self, arg: usize) {
-        self.defeat_propagated[arg] = true;
+    /// Count one more of `arg`'s attackers as propagated in, and return
+    /// whether it is the first -- i.e. whether `arg`'s defeat is new
+    pub fn add_in_attacker(&mut self, arg: usize) -> bool {
+        self.in_attackers_count[arg] += 1;
+        self.in_attackers_count[arg] == 1
+    }
+
+    /// Count one fewer of `arg`'s attackers as propagated in, and return
+    /// whether it was the last -- i.e. whether `arg`'s defeat is undone
+    pub fn remove_in_attacker(&mut self, arg: usize) -> bool {
+        self.in_attackers_count[arg] -= 1;
+        self.in_attackers_count[arg] == 0
+    }
+
+    /// Get the number of `arg`'s attackers not yet known to be defeated in
+    /// every completion
+    pub fn undefeated_attackers_count(&self, arg: usize) -> usize {
+        self.undefeated_attackers_count[arg]
     }
 
     /// Decrement the number of `arg`'s attackers not yet known to be
-    /// defeated in every completion, and return the new count
-    pub fn decrement_undefeated_attackers(&mut self, arg: usize) -> usize {
+    /// defeated in every completion
+    pub fn decrement_undefeated_attackers(&mut self, arg: usize) {
         self.undefeated_attackers_count[arg] -= 1;
-        self.undefeated_attackers_count[arg]
+    }
+
+    /// Increment the number of `arg`'s attackers not yet known to be
+    /// defeated in every completion
+    pub fn increment_undefeated_attackers(&mut self, arg: usize) {
+        self.undefeated_attackers_count[arg] += 1;
     }
 
     /// Check whether `arg` is known to be defeated in every completion.
@@ -230,14 +309,13 @@ impl Node {
         self.known_defeated[arg]
     }
 
-    /// Record that `arg` is defeated in every completion. Returns `false`,
-    /// leaving the node unchanged, if it was already known.
-    pub fn assign_def(&mut self, arg: usize) -> bool {
-        if self.known_defeated[arg] {
-            return false;
+    /// Record that `arg` is defeated in every completion, appending it to
+    /// the trail. Does nothing if it was already known.
+    pub fn assign_def(&mut self, arg: usize) {
+        if !self.known_defeated[arg] {
+            self.known_defeated[arg] = true;
+            self.trail.push(Lit::Def(arg));
         }
-        self.known_defeated[arg] = true;
-        true
     }
 
     /// Check whether every argument in this node's set is defended by the
@@ -252,6 +330,27 @@ impl Node {
         self.value.iter().enumerate()
             .filter_map(|(arg, &value)| (value == Value::In).then_some(arg))
             .collect()
+    }
+}
+
+#[cfg(test)]
+impl Node {
+    /// Assert that this node is in exactly the state `other` is in, apart
+    /// from the stale reasons of undecided arguments, which mean nothing
+    pub fn assert_same_state(&self, other: &Node) {
+        assert_eq!(self.value, other.value, "values differ");
+        for (a, &value) in self.value.iter().enumerate() {
+            if value != Value::Undecided {
+                assert_eq!(self.reason[a], other.reason[a], "reasons of {a} differ");
+            }
+        }
+        assert_eq!(self.unattacked_attackers_count, other.unattacked_attackers_count);
+        assert_eq!(self.in_attackers_count, other.in_attackers_count);
+        assert_eq!(self.undefeated_attackers_count, other.undefeated_attackers_count);
+        assert_eq!(self.known_defeated, other.known_defeated);
+        assert_eq!(self.usable_defenders_count, other.usable_defenders_count);
+        assert_eq!(self.trail, other.trail);
+        assert_eq!(self.propagated, other.propagated);
     }
 }
 
