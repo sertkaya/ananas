@@ -12,30 +12,24 @@ pub enum Value {
 }
 
 /// Why an argument was assigned its value. Recorded with every assignment
-/// so that a conflict can later be traced back to the assignments that
-/// caused it.
-///
-/// Only the rule is recorded, not the arguments it fired on: the node is
-/// cloned for every search step, so it stays one byte per argument. The
-/// antecedents are cheap to recover from the framework when a conflict
-/// needs explaining, which is rare by comparison.
+/// so that a conflict can be traced back to the assignments that caused it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
 pub enum Reason {
     /// In by assumption: the query argument, an unattacked argument, or a
     /// search decision
     Decision,
     /// Out because it attacks itself
     SelfAttack,
-    /// Out because a search candidate's whole subtree failed with it in
+    /// Out because a search candidate's whole subtree failed with it in.
+    /// Like a decision, it has no antecedents on the trail.
     RuledOut,
-    /// Out because it attacks, or is attacked by, a member
-    Member,
+    /// Out because it attacks, or is attacked by, the given member
+    Member(usize),
     /// In because every one of its attackers is known defeated
     Completeness,
-    /// In because it is the only usable defender left against an argument
-    /// it attacks, which must be defeated
-    OnlyDefender,
+    /// In because it is the only usable defender left against the given
+    /// argument, which must be defeated: every other attacker of it is out
+    OnlyDefender(usize),
 }
 
 /// A fact assigned during propagation, whose consequences are still to be
@@ -48,6 +42,18 @@ pub enum Lit {
     Out(usize),
     /// The argument is defeated in every complete extension of the set
     Def(usize),
+}
+
+impl Lit {
+    /// The opposite of an `In` or `Out` literal. `Def` has no opposite:
+    /// nothing ever records that an argument must stay undefeated.
+    pub fn negated(self) -> Lit {
+        match self {
+            Lit::In(a) => Lit::Out(a),
+            Lit::Out(a) => Lit::In(a),
+            Lit::Def(_) => panic!("Def literals have no negation"),
+        }
+    }
 }
 
 /// Outcome of assigning a value to an argument
@@ -76,9 +82,10 @@ pub struct Node {
     // was ruled out because a candidate's whole subtree failed; the closure
     // must fail rather than force an out argument back in.
     value: Vec<Value>,
-    // Why each decided argument got its value. Meaningless for undecided
-    // arguments.
+    // Why each decided argument got its value, and at which decision level.
+    // Meaningless for undecided arguments.
     reason: Vec<Reason>,
+    level: Vec<usize>,
     // Number of unattacked attackers for each argument
     unattacked_attackers_count: Vec<usize>,
     // Number of each argument's attackers whose being in has been
@@ -97,6 +104,9 @@ pub struct Node {
     // this node's set, with that fact on the trail for propagation to its
     // own victims' undefeated_attackers_count
     known_defeated: Vec<bool>,
+    // For each argument known defeated, the member that established it:
+    // one the argument attacks or is attacked by. Meaningless otherwise.
+    def_source: Vec<usize>,
     // Number of each argument's attackers whose being out has not yet been
     // propagated. Never less than the number of attackers that could still
     // be added, so for an undefeated attacker of the set it bounds the ways
@@ -109,6 +119,9 @@ pub struct Node {
     // How many assignments at the front of the trail have had their
     // consequences propagated; the rest are still queued.
     propagated: usize,
+    // The trail's length when each decision level above 0 began, so the
+    // current decision level is the length of this
+    level_start: Vec<usize>,
 }
 
 // Create a new node
@@ -125,6 +138,7 @@ impl Node {
             .map(|&s| if s { Value::Out } else { Value::Undecided })
             .collect();
         let reason = vec![Reason::SelfAttack; af.argument_count()];
+        let level = vec![0; af.argument_count()];
         let unattacked_attackers_count = (0..af.argument_count())
             .map(|a| af.attacker_count(a))
             .collect();
@@ -133,19 +147,23 @@ impl Node {
             .map(|a| af.attacker_count(a))
             .collect();
         let known_defeated = vec![false; af.argument_count()];
+        let def_source = vec![0; af.argument_count()];
         let usable_defenders_count = (0..af.argument_count())
             .map(|a| af.attackers(a).filter(|&&b| !self_attacking[b]).count())
             .collect();
         Node {
             value,
             reason,
+            level,
             unattacked_attackers_count,
             in_attackers_count,
             undefeated_attackers_count,
             known_defeated,
+            def_source,
             usable_defenders_count,
             trail: Vec::new(),
             propagated: 0,
+            level_start: Vec::new(),
         }
     }
 
@@ -155,10 +173,36 @@ impl Node {
     }
 
     /// Get why a decided argument got its value
-    // Not read outside tests until conflict analysis lands
-    #[allow(dead_code)]
     pub fn reason(&self, arg: usize) -> Reason {
         self.reason[arg]
+    }
+
+    /// Get the decision level at which a decided argument got its value
+    pub fn level(&self, arg: usize) -> usize {
+        self.level[arg]
+    }
+
+    /// Get the current decision level: 0 until the first decision
+    pub fn decision_level(&self) -> usize {
+        self.level_start.len()
+    }
+
+    /// Begin a new decision level, above the current one
+    pub fn new_level(&mut self) {
+        self.level_start.push(self.trail.len());
+    }
+
+    /// Drop every decision level above `level`, returning the length the
+    /// trail had when the first of them began -- what to backtrack it to
+    pub fn drop_levels_above(&mut self, level: usize) -> usize {
+        let len = self.level_start[level];
+        self.level_start.truncate(level);
+        len
+    }
+
+    /// Get every assignment made so far, in order
+    pub fn trail(&self) -> &[Lit] {
+        &self.trail
     }
 
     /// Assign a value, `Value::In` or `Value::Out`, to an argument, for the
@@ -173,17 +217,13 @@ impl Node {
         } else {
             self.value[arg] = value;
             self.reason[arg] = reason;
+            self.level[arg] = self.level_start.len();
             self.trail.push(match value {
                 Value::In => Lit::In(arg),
                 _ => Lit::Out(arg),
             });
             Assignment::New
         }
-    }
-
-    /// Get the length of the trail, to backtrack to later
-    pub fn trail_len(&self) -> usize {
-        self.trail.len()
     }
 
     /// Take the next assignment whose consequences are still to be
@@ -309,11 +349,19 @@ impl Node {
         self.known_defeated[arg]
     }
 
-    /// Record that `arg` is defeated in every completion, appending it to
-    /// the trail. Does nothing if it was already known.
-    pub fn assign_def(&mut self, arg: usize) {
+    /// Get the member that established `arg` as defeated in every
+    /// completion. Meaningless unless `arg` is known defeated.
+    pub fn def_source(&self, arg: usize) -> usize {
+        self.def_source[arg]
+    }
+
+    /// Record that `arg` is defeated in every completion because of
+    /// `member`, appending it to the trail. Does nothing if it was already
+    /// known.
+    pub fn assign_def(&mut self, arg: usize, member: usize) {
         if !self.known_defeated[arg] {
             self.known_defeated[arg] = true;
+            self.def_source[arg] = member;
             self.trail.push(Lit::Def(arg));
         }
     }
@@ -336,12 +384,16 @@ impl Node {
 #[cfg(test)]
 impl Node {
     /// Assert that this node is in exactly the state `other` is in, apart
-    /// from the stale reasons of undecided arguments, which mean nothing
+    /// from stale entries for undecided arguments, which mean nothing
     pub fn assert_same_state(&self, other: &Node) {
         assert_eq!(self.value, other.value, "values differ");
         for (a, &value) in self.value.iter().enumerate() {
             if value != Value::Undecided {
                 assert_eq!(self.reason[a], other.reason[a], "reasons of {a} differ");
+                assert_eq!(self.level[a], other.level[a], "levels of {a} differ");
+            }
+            if self.known_defeated[a] {
+                assert_eq!(self.def_source[a], other.def_source[a], "def sources of {a} differ");
             }
         }
         assert_eq!(self.unattacked_attackers_count, other.unattacked_attackers_count);
@@ -351,6 +403,7 @@ impl Node {
         assert_eq!(self.usable_defenders_count, other.usable_defenders_count);
         assert_eq!(self.trail, other.trail);
         assert_eq!(self.propagated, other.propagated);
+        assert_eq!(self.level_start, other.level_start);
     }
 }
 

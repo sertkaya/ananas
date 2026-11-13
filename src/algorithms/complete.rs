@@ -1,17 +1,20 @@
 use std::collections::HashSet;
+use std::fmt::{Display, Formatter};
 use crate::af::AF;
-use crate::algorithms::closure::{backtrack, pseudo_complete, rule_out};
+use crate::algorithms::closure::{backtrack_to_level, pseudo_complete, rule_out, Conflict};
+use crate::algorithms::learning::analyze;
 use crate::algorithms::node::{Node, Value};
 
-/// A node of the search tree: where its assignments start on the search's
-/// trail, and the candidate arguments still to be tried, lazily, for
-/// defeating its most constrained undefeated attacker. The arguments
-/// already known (from earlier failed candidates tried at or above this
-/// point) to be unsuitable for this branch are out on the trail.
+/// A node of the search tree: its decision level, and the candidate
+/// arguments still to be tried, lazily, for defeating its most constrained
+/// undefeated attacker. The arguments already known (from earlier failed
+/// candidates tried at or above this point) to be unsuitable for this
+/// branch are out on the trail.
 struct Frame {
-    // Length of the trail before this frame's own decision, so that
-    // backtracking to it undoes the frame entirely
-    start: usize,
+    // The decision level this frame's own decision opened, so that
+    // backtracking to the level below undoes the frame entirely. 0 for the
+    // root, which has no decision of its own.
+    level: usize,
     candidates: Vec<usize>,
     // The candidate whose subtree we just pushed on top of this frame, if
     // any. If this frame is popped again while this is set, that subtree
@@ -86,57 +89,125 @@ fn candidates(node: &Node, af: &AF) -> Vec<usize> {
     result
 }
 
-/// Format the diagnostic counters tracked by `dc_co` for a `verbose` print.
-fn format_stats(
+/// Search-tree diagnostics gathered by `dc_co` for a `verbose` print
+#[derive(Default)]
+struct Stats {
     nodes_visited: usize,
     pseudo_complete_calls: usize,
+    // Distribution of candidates.len() at every frame creation (root and
+    // children), to see whether difficulty comes from many nodes each
+    // having a handful of candidates, or a few nodes with huge candidate
+    // lists.
     frames_created: usize,
     candidate_count_sum: usize,
-    candidate_count_min: usize,
+    candidate_count_min: Option<usize>,
     candidate_count_max: usize,
+    // How often candidates() came back empty: the branch was already dead,
+    // but pseudo_complete did not notice, so we paid a full candidate scan
+    // to find out.
     empty_candidate_lists: usize,
-) -> String {
-    let avg = if frames_created > 0 {
-        candidate_count_sum as f64 / frames_created as f64
-    } else {
-        0.0
-    };
-    let min = if frames_created > 0 { candidate_count_min } else { 0 };
-    format!(
-        "nodes_visited={nodes_visited} pseudo_complete_calls={pseudo_complete_calls} \
-         frames_created={frames_created} candidates_avg={avg:.2} \
-         candidates_min={min} candidates_max={candidate_count_max} \
-         empty_candidate_lists={empty_candidate_lists}"
-    )
+    // What conflict learning would make of the search's conflicts: how
+    // many there are, how long the clauses learned from them are, and how
+    // many decision levels each would jump back over -- where the search
+    // itself always backtracks exactly one.
+    conflicts: usize,
+    learned_literals_sum: usize,
+    learned_literals_max: usize,
+    backjump_sum: usize,
+    backjump_max: usize,
+    nonchronological_backjumps: usize,
+}
+
+impl Stats {
+    /// Record a frame created with `candidates` to try
+    fn record_frame(&mut self, candidates: &[usize]) {
+        self.frames_created += 1;
+        self.candidate_count_sum += candidates.len();
+        self.candidate_count_max = self.candidate_count_max.max(candidates.len());
+        self.candidate_count_min = Some(
+            self.candidate_count_min.map_or(candidates.len(), |m| m.min(candidates.len())),
+        );
+        if candidates.is_empty() {
+            self.empty_candidate_lists += 1;
+        }
+    }
+
+    /// Analyse `conflict`, just run into on `node`, and record the clause
+    /// learning would make of it
+    fn record_conflict(&mut self, conflict: Conflict, node: &Node, af: &AF) {
+        let Some(learned) = analyze(conflict, node, af) else {
+            return;
+        };
+        let jump = node.decision_level() - learned.assertion_level;
+        self.conflicts += 1;
+        self.learned_literals_sum += learned.literals.len();
+        self.learned_literals_max = self.learned_literals_max.max(learned.literals.len());
+        self.backjump_sum += jump;
+        self.backjump_max = self.backjump_max.max(jump);
+        if jump > 1 {
+            self.nonchronological_backjumps += 1;
+        }
+    }
+}
+
+impl Display for Stats {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        let average = |sum: usize, count: usize| {
+            if count > 0 { sum as f64 / count as f64 } else { 0.0 }
+        };
+        write!(
+            f,
+            "nodes_visited={} pseudo_complete_calls={} frames_created={} \
+             candidates_avg={:.2} candidates_min={} candidates_max={} \
+             empty_candidate_lists={}",
+            self.nodes_visited,
+            self.pseudo_complete_calls,
+            self.frames_created,
+            average(self.candidate_count_sum, self.frames_created),
+            self.candidate_count_min.unwrap_or(0),
+            self.candidate_count_max,
+            self.empty_candidate_lists,
+        )?;
+        if self.conflicts > 0 {
+            write!(
+                f,
+                " conflicts={} learned_len_avg={:.1} learned_len_max={} \
+                 backjump_avg={:.2} backjump_max={} nonchronological_backjumps={}",
+                self.conflicts,
+                average(self.learned_literals_sum, self.conflicts),
+                self.learned_literals_max,
+                average(self.backjump_sum, self.conflicts),
+                self.backjump_max,
+                self.nonchronological_backjumps,
+            )?;
+        }
+        Ok(())
+    }
 }
 
 /// Decide DC-CO: is `arg` credulously accepted with respect to the complete
 /// semantics? Returns the complete extension of `af` containing `arg` if one
 /// exists, `None` otherwise. If `verbose`, prints search-tree size
 /// diagnostics (nodes visited, pseudo_complete calls) to stderr as it runs
-/// -- useful for investigating slow instances.
+/// -- useful for investigating slow instances -- and analyses every
+/// conflict to report what conflict learning would make of it.
 pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
-    let mut nodes_visited: usize = 0;
-    let mut pseudo_complete_calls: usize = 0;
-    // Distribution of candidates.len() at every frame creation (root and
-    // children), to see whether difficulty comes from many nodes each
-    // having a handful of candidates, or a few nodes with huge candidate
-    // lists.
-    let mut frames_created: usize = 0;
-    let mut candidate_count_sum: usize = 0;
-    let mut candidate_count_max: usize = 0;
-    let mut candidate_count_min: usize = usize::MAX;
-    // How often candidates() came back empty: the branch was already dead,
-    // but pseudo_complete did not notice, so we paid a full candidate scan
-    // to find out. Measures what the once-per-attacker no-defender check
-    // misses.
-    let mut empty_candidate_lists: usize = 0;
+    let mut stats = Stats::default();
+    let result = search(af, arg, verbose, &mut stats);
+    if verbose {
+        eprintln!("[dc_co stats] {stats}");
+    }
+    result
+}
 
+/// The search behind `dc_co`, gathering diagnostics into `stats`
+fn search(af: &AF, arg: usize, verbose: bool, stats: &mut Stats) -> Option<HashSet<usize>> {
     let mut node = Node::new(af);
 
     // We hypothesize that `arg` is in the extension, and arguments with no
     // attackers are defended by default, so both are seeds; pseudo_complete
-    // adds them to `node` before propagating their effects.
+    // adds them to `node` before propagating their effects. They make up
+    // decision level 0.
     let mut seeds = vec![arg];
     for a in 0..af.argument_count() {
         if af.attacker_count(a) == 0 {
@@ -144,23 +215,12 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         }
     }
 
-    pseudo_complete_calls += 1;
-    if !pseudo_complete(seeds, &mut node, af) {
+    stats.pseudo_complete_calls += 1;
+    if let Err(conflict) = pseudo_complete(seeds, &mut node, af) {
         // The hypothesis that `arg` is in the extension is already
         // contradictory: closing it produced a conflict.
         if verbose {
-            eprintln!(
-                "[dc_co stats] {}",
-                format_stats(
-                    nodes_visited,
-                    pseudo_complete_calls,
-                    frames_created,
-                    candidate_count_sum,
-                    candidate_count_min,
-                    candidate_count_max,
-                    empty_candidate_lists
-                )
-            );
+            stats.record_conflict(conflict, &node, af);
         }
         return None;
     }
@@ -169,53 +229,21 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // The set is conflict-free (checked above) and closed under
         // defense (guaranteed by pseudo_complete), and now every argument
         // in it defends itself: that's exactly a complete extension.
-        if verbose {
-            eprintln!(
-                "[dc_co stats] {}",
-                format_stats(
-                    nodes_visited,
-                    pseudo_complete_calls,
-                    frames_created,
-                    candidate_count_sum,
-                    candidate_count_min,
-                    candidate_count_max,
-                    empty_candidate_lists
-                )
-            );
-        }
         return Some(node.arguments());
     }
 
     let root_candidates = candidates(&node, af);
-    if root_candidates.is_empty() {
-        empty_candidate_lists += 1;
-    }
-    frames_created += 1;
-    candidate_count_sum += root_candidates.len();
-    candidate_count_max = candidate_count_max.max(root_candidates.len());
-    candidate_count_min = candidate_count_min.min(root_candidates.len());
+    stats.record_frame(&root_candidates);
     let mut stack: Vec<Frame> = vec![Frame {
-        start: 0,
+        level: 0,
         candidates: root_candidates,
         pending_candidate: None,
     }];
 
     while let Some(mut frame) = stack.pop() {
-        nodes_visited += 1;
-        if verbose && nodes_visited.is_multiple_of(1000) {
-            eprintln!(
-                "[dc_co progress] {} stack_len={}",
-                format_stats(
-                    nodes_visited,
-                    pseudo_complete_calls,
-                    frames_created,
-                    candidate_count_sum,
-                    candidate_count_min,
-                    candidate_count_max,
-                    empty_candidate_lists
-                ),
-                stack.len()
-            );
+        stats.nodes_visited += 1;
+        if verbose && stats.nodes_visited.is_multiple_of(1000) {
+            eprintln!("[dc_co progress] {stats} stack_len={}", stack.len());
         }
 
         // If set, the candidate's whole subtree just failed (see
@@ -227,9 +255,14 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // frame fails at once instead of sibling by sibling.
         // Either way the frame is then done with, and is undone.
         if let Some(failed) = frame.pending_candidate.take()
-            && !rule_out(failed, &mut node, af)
+            && let Err(conflict) = rule_out(failed, &mut node, af)
         {
-            backtrack(frame.start, &mut node, af);
+            if verbose {
+                stats.record_conflict(conflict, &node, af);
+            }
+            if frame.level > 0 {
+                backtrack_to_level(frame.level - 1, &mut node, af);
+            }
             continue;
         }
 
@@ -237,67 +270,41 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
         // sibling is only ever generated once this candidate's whole
         // subtree has been fully explored and abandoned.
         let Some(c) = frame.candidates.pop() else {
-            backtrack(frame.start, &mut node, af);
+            if frame.level > 0 {
+                backtrack_to_level(frame.level - 1, &mut node, af);
+            }
             continue;
         };
 
         // Push this frame back before trying c, regardless of outcome: if c
         // fails immediately, we'll pop it again right away; if it needs a
         // subtree, that gets pushed on top of it next.
+        let level = frame.level;
         frame.pending_candidate = Some(c);
         stack.push(frame);
 
-        let child_start = node.trail_len();
-        pseudo_complete_calls += 1;
-        if !pseudo_complete(vec![c], &mut node, af) {
-            backtrack(child_start, &mut node, af);
-        } else {
-            if node.is_self_defending() {
+        node.new_level();
+        stats.pseudo_complete_calls += 1;
+        match pseudo_complete(vec![c], &mut node, af) {
+            Err(conflict) => {
                 if verbose {
-                    eprintln!(
-                "[dc_co stats] {}",
-                format_stats(
-                    nodes_visited,
-                    pseudo_complete_calls,
-                    frames_created,
-                    candidate_count_sum,
-                    candidate_count_min,
-                    candidate_count_max,
-                    empty_candidate_lists
-                )
-            );
+                    stats.record_conflict(conflict, &node, af);
                 }
-                return Some(node.arguments());
+                backtrack_to_level(level, &mut node, af);
             }
-            let child_candidates = candidates(&node, af);
-            if child_candidates.is_empty() {
-                empty_candidate_lists += 1;
+            Ok(()) => {
+                if node.is_self_defending() {
+                    return Some(node.arguments());
+                }
+                let child_candidates = candidates(&node, af);
+                stats.record_frame(&child_candidates);
+                stack.push(Frame {
+                    level: level + 1,
+                    candidates: child_candidates,
+                    pending_candidate: None,
+                });
             }
-            frames_created += 1;
-            candidate_count_sum += child_candidates.len();
-            candidate_count_max = candidate_count_max.max(child_candidates.len());
-            candidate_count_min = candidate_count_min.min(child_candidates.len());
-            stack.push(Frame {
-                start: child_start,
-                candidates: child_candidates,
-                pending_candidate: None,
-            });
         }
-    }
-
-    if verbose {
-        eprintln!(
-            "[dc_co stats] {}",
-            format_stats(
-                nodes_visited,
-                pseudo_complete_calls,
-                frames_created,
-                candidate_count_sum,
-                candidate_count_min,
-                candidate_count_max,
-                empty_candidate_lists
-            )
-        );
     }
     None
 }
@@ -387,8 +394,8 @@ mod tests {
         af.add_attack(3, 1);
         af.add_attack(4, 1);
         let mut node = Node::new(&af);
-        assert!(rule_out(4, &mut node, &af));
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(rule_out(4, &mut node, &af).is_ok());
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         let result = candidates(&node, &af);
         assert!(!result.contains(&4), "4 was ruled out for this branch");
@@ -413,7 +420,7 @@ mod tests {
         af.add_attack(4, 1);
         af.add_attack(0, 2);
         let mut node = Node::new(&af);
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         let result = candidates(&node, &af);
         assert!(!result.contains(&2), "2 is attacked by the set, so it can never be added");

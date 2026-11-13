@@ -1,18 +1,30 @@
 use crate::af::AF;
 use crate::algorithms::node::{Assignment, Lit, Node, Reason, Value};
 
-/// Put `arg` in the set for `reason`. Returns `false` if `arg` is already
-/// out.
-#[must_use]
-fn set_in(arg: usize, reason: Reason, node: &mut Node) -> bool {
-    node.assign(arg, Value::In, reason) != Assignment::Conflict
+/// A contradiction that propagation ran into
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Conflict {
+    /// `arg` would have to get the opposite of the value it has, for
+    /// `reason`
+    Clash { arg: usize, reason: Reason },
+    /// The argument must be defeated, but every one of its attackers is out
+    NoDefender(usize),
 }
 
-/// Rule `arg` out of the set for `reason`. Returns `false` if `arg` is
-/// already in.
-#[must_use]
-fn set_out(arg: usize, reason: Reason, node: &mut Node) -> bool {
-    node.assign(arg, Value::Out, reason) != Assignment::Conflict
+/// Put `arg` in the set for `reason`. Fails if `arg` is already out.
+fn set_in(arg: usize, reason: Reason, node: &mut Node) -> Result<(), Conflict> {
+    match node.assign(arg, Value::In, reason) {
+        Assignment::Conflict => Err(Conflict::Clash { arg, reason }),
+        _ => Ok(()),
+    }
+}
+
+/// Rule `arg` out of the set for `reason`. Fails if `arg` is already in.
+fn set_out(arg: usize, reason: Reason, node: &mut Node) -> Result<(), Conflict> {
+    match node.assign(arg, Value::Out, reason) {
+        Assignment::Conflict => Err(Conflict::Clash { arg, reason }),
+        _ => Ok(()),
+    }
 }
 
 /// Check whether the set still has a way to defend itself against `b`,
@@ -28,24 +40,23 @@ fn set_out(arg: usize, reason: Reason, node: &mut Node) -> bool {
 /// overestimates. The cheap count settles the common case; below 2 the
 /// defenders are checked exactly against the assignment.
 ///
-/// Returns `false` if the branch is dead.
-#[must_use]
-fn resolve_defenders(b: usize, node: &mut Node, af: &AF) -> bool {
+/// Fails if the branch is dead.
+fn resolve_defenders(b: usize, node: &mut Node, af: &AF) -> Result<(), Conflict> {
     if !node.known_defeated(b) || node.usable_defenders_count(b) > 1 {
         // Either nothing demands that `b` be defeated, or there is still a
         // choice of defenders: a flag and an array read, and nothing is
         // forced or settled.
-        return true;
+        return Ok(());
     }
     if node.is_defeated(af, b) {
         // A member already attacks `b`, so the demand is met.
-        return true;
+        return Ok(());
     }
     // At most one attacker can be anything but out, since the count bounds
     // them from above.
     match af.attackers(b).copied().find(|&c| !node.is_out(c)) {
-        None => false,
-        Some(survivor) => set_in(survivor, Reason::OnlyDefender, node),
+        None => Err(Conflict::NoDefender(b)),
+        Some(survivor) => set_in(survivor, Reason::OnlyDefender(b), node),
     }
 }
 
@@ -131,12 +142,11 @@ fn unapply(lit: Lit, node: &mut Node, af: &AF) {
 /// propagated later, in trail order; so an argument's value is exact even
 /// while the counters derived from it are catching up.
 ///
-/// Returns `false` as soon as an argument would have to be both in and
-/// out, or would have to be defeated with no way left to defeat it. The
-/// node is then contradictory, and must be backtracked to before whatever
-/// assignment was being propagated.
-#[must_use]
-pub fn propagate(node: &mut Node, af: &AF) -> bool {
+/// Fails as soon as an argument would have to be both in and out, or would
+/// have to be defeated with no way left to defeat it. The node is then
+/// contradictory, and must be backtracked to before whatever assignment
+/// was being propagated.
+pub fn propagate(node: &mut Node, af: &AF) -> Result<(), Conflict> {
     while let Some(lit) = node.next_to_propagate() {
         apply(lit, node, af);
         match lit {
@@ -144,50 +154,40 @@ pub fn propagate(node: &mut Node, af: &AF) -> bool {
                 for &v in af.victims(m) {
                     // Semi-complete: `v` conflicts with the set and is
                     // defeated in every completion.
-                    if !set_out(v, Reason::Member, node) {
-                        return false;
-                    }
-                    node.assign_def(v);
+                    set_out(v, Reason::Member(m), node)?;
+                    node.assign_def(v, m);
                 }
                 for &b in af.attackers(m) {
                     // Quasi-complete: `b` conflicts with the set, and any
                     // completion must defend `m` by attacking `b` back.
-                    if !set_out(b, Reason::Member, node) {
-                        return false;
-                    }
-                    node.assign_def(b);
+                    set_out(b, Reason::Member(m), node)?;
+                    node.assign_def(b, m);
                 }
             }
             Lit::Out(c) => {
                 for &v in af.victims(c) {
-                    if !resolve_defenders(v, node, af) {
-                        return false;
-                    }
+                    resolve_defenders(v, node, af)?;
                 }
             }
             Lit::Def(b) => {
                 // A victim of `b` with no attacker left that is not known
                 // defeated is defended in every completion, so must be in.
                 for &v in af.victims(b) {
-                    if node.undefeated_attackers_count(v) == 0
-                        && !set_in(v, Reason::Completeness, node)
-                    {
-                        return false;
+                    if node.undefeated_attackers_count(v) == 0 {
+                        set_in(v, Reason::Completeness, node)?;
                     }
                 }
                 // `b` must be defeated, so the set needs a defender against it.
-                if !resolve_defenders(b, node, af) {
-                    return false;
-                }
+                resolve_defenders(b, node, af)?;
             }
         }
     }
-    true
+    Ok(())
 }
 
 /// Undo every assignment made after the trail was `len` long, reversing
 /// their effect on the counters, so that `node` is exactly as it was then.
-pub fn backtrack(len: usize, node: &mut Node, af: &AF) {
+fn backtrack(len: usize, node: &mut Node, af: &AF) {
     while let Some((lit, was_propagated)) = node.unassign_last(len) {
         if was_propagated {
             unapply(lit, node, af);
@@ -195,17 +195,21 @@ pub fn backtrack(len: usize, node: &mut Node, af: &AF) {
     }
 }
 
+/// Undo every decision level above `level`, so that `node` is exactly as
+/// it was when the next level began.
+pub fn backtrack_to_level(level: usize, node: &mut Node, af: &AF) {
+    let len = node.drop_levels_above(level);
+    backtrack(len, node, af);
+}
+
 /// Put the `seeds` in `node`'s set as assumptions and extend it with its
 /// smallest pseudo-complete superset; see `propagate`.
 ///
-/// Returns `false` if that runs into a conflict, leaving `node`
-/// contradictory until it is backtracked to before the seeds.
-#[must_use]
-pub fn pseudo_complete(seeds: Vec<usize>, node: &mut Node, af: &AF) -> bool {
+/// Fails if that runs into a conflict, leaving `node` contradictory until
+/// it is backtracked to before the seeds.
+pub fn pseudo_complete(seeds: Vec<usize>, node: &mut Node, af: &AF) -> Result<(), Conflict> {
     for arg in seeds {
-        if !set_in(arg, Reason::Decision, node) {
-            return false;
-        }
+        set_in(arg, Reason::Decision, node)?;
     }
     propagate(node, af)
 }
@@ -215,13 +219,10 @@ pub fn pseudo_complete(seeds: Vec<usize>, node: &mut Node, af: &AF) -> bool {
 /// this branch, not even as a side effect of some other candidate's
 /// closure.
 ///
-/// Returns `false` if that runs into a conflict, leaving `node`
-/// contradictory until it is backtracked to before the ruling-out.
-#[must_use]
-pub fn rule_out(arg: usize, node: &mut Node, af: &AF) -> bool {
-    if !set_out(arg, Reason::RuledOut, node) {
-        return false;
-    }
+/// Fails if that runs into a conflict, leaving `node` contradictory until
+/// it is backtracked to before the ruling-out.
+pub fn rule_out(arg: usize, node: &mut Node, af: &AF) -> Result<(), Conflict> {
+    set_out(arg, Reason::RuledOut, node)?;
     propagate(node, af)
 }
 
@@ -244,23 +245,26 @@ mod tests {
                     af.attackers(a).all(|&b| node.known_defeated(b)),
                     "{a} is in by completeness with an attacker not known defeated"
                 ),
-                (Value::In, Reason::OnlyDefender) => assert!(
-                    af.victims(a).any(|&b| node.known_defeated(b)
-                        && af.attackers(b).all(|&c| c == a || node.is_out(c))),
-                    "{a} is not the only defender left against anything it attacks"
-                ),
+                (Value::In, Reason::OnlyDefender(b)) => {
+                    assert!(af.attacks(a, b) && node.known_defeated(b));
+                    assert!(
+                        af.attackers(b).all(|&c| c == a || node.is_out(c)),
+                        "{a} is not the only defender left against {b}"
+                    );
+                }
                 (Value::Out, Reason::SelfAttack) => assert!(af.attacks(a, a)),
                 (Value::Out, Reason::RuledOut) => {}
-                (Value::Out, Reason::Member) => assert!(
-                    node.is_defeated(af, a) || af.victims(a).any(|&v| node.contains(v)),
-                    "{a} is out for conflicting with the set, but does not"
+                (Value::Out, Reason::Member(m)) => assert!(
+                    node.contains(m) && (af.attacks(m, a) || af.attacks(a, m)),
+                    "{a} is out for conflicting with {m}, but does not"
                 ),
                 (value, reason) => panic!("{a} is {value:?} for {reason:?}"),
             }
             if node.known_defeated(a) {
+                let m = node.def_source(a);
                 assert!(
-                    node.is_defeated(af, a) || af.victims(a).any(|&v| node.contains(v)),
-                    "{a} is known defeated without attacking or being attacked by the set"
+                    node.contains(m) && (af.attacks(m, a) || af.attacks(a, m)),
+                    "{a} is known defeated because of {m}, but neither attacks the other"
                 );
                 assert!(node.is_out(a), "{a} is known defeated but not out");
             }
@@ -295,15 +299,15 @@ mod tests {
             let mut node = Node::new(&af);
             let mut seeds = vec![rng.below(n)];
             seeds.extend((0..n).filter(|&a| af.attacker_count(a) == 0));
-            if !pseudo_complete(seeds, &mut node, &af) {
+            if pseudo_complete(seeds, &mut node, &af).is_err() {
                 conflicts += 1;
                 backtrack(0, &mut node, &af);
                 node.assert_same_state(&Node::new(&af));
                 continue;
             }
             let snapshot = node.clone();
-            let mark = node.trail_len();
             for _ in 0..1 + rng.below(3) {
+                node.new_level();
                 let undecided: Vec<usize> = (0..n)
                     .filter(|&a| node.value(a) == Value::Undecided)
                     .collect();
@@ -312,16 +316,16 @@ mod tests {
                 }
                 let c = undecided[rng.below(undecided.len())];
                 let consistent = if rng.below(2) == 0 {
-                    pseudo_complete(vec![c], &mut node, &af)
+                    pseudo_complete(vec![c], &mut node, &af).is_ok()
                 } else {
-                    rule_out(c, &mut node, &af)
+                    rule_out(c, &mut node, &af).is_ok()
                 };
                 if !consistent {
                     conflicts += 1;
                     break;
                 }
             }
-            backtrack(mark, &mut node, &af);
+            backtrack_to_level(0, &mut node, &af);
             node.assert_same_state(&snapshot);
         }
         assert!(conflicts > 200, "too few conflicts ({conflicts}) to test undoing them");
@@ -341,7 +345,7 @@ mod tests {
             let mut node = Node::new(&af);
             let mut seeds = vec![rng.below(n)];
             seeds.extend((0..n).filter(|&a| af.attacker_count(a) == 0));
-            if !pseudo_complete(seeds, &mut node, &af) {
+            if pseudo_complete(seeds, &mut node, &af).is_err() {
                 continue;
             }
             check_node(&node, &af);
@@ -351,7 +355,7 @@ mod tests {
                 .collect();
             if !undecided.is_empty() {
                 let c = undecided[rng.below(undecided.len())];
-                if rule_out(c, &mut node, &af) {
+                if rule_out(c, &mut node, &af).is_ok() {
                     check_node(&node, &af);
                 }
             }
@@ -373,7 +377,7 @@ mod tests {
         let af = build_af();
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         assert!(node.contains(0));
         assert!(!node.contains(1));
@@ -400,7 +404,7 @@ mod tests {
             }
         }
 
-        assert!(pseudo_complete(update, &mut node, &af));
+        assert!(pseudo_complete(update, &mut node, &af).is_ok());
 
         for arg in 0..af.argument_count() {
             assert!(!node.contains(arg));
@@ -420,7 +424,7 @@ mod tests {
         let af = read_af(input_af);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         assert!(node.contains(0));
         assert!(!node.contains(1));
@@ -443,7 +447,7 @@ mod tests {
         af.add_attack(2, 0);
         let mut node = Node::new(&af);
 
-        assert!(!pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_err());
     }
 
     // Regression test: 0 and 1 both attack 2 (attacker_count(2)=2); 2 and 4
@@ -462,7 +466,7 @@ mod tests {
         af.add_attack(4, 4);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0, 1], &mut node, &af));
+        assert!(pseudo_complete(vec![0, 1], &mut node, &af).is_ok());
 
         println!("{}", node);
         assert!(!node.contains(3), "3's attacker 4 was never defeated");
@@ -478,9 +482,9 @@ mod tests {
         af.add_attack(0, 1);
         af.add_attack(1, 2);
         let mut node = Node::new(&af);
-        assert!(rule_out(2, &mut node, &af));
+        assert!(rule_out(2, &mut node, &af).is_ok());
 
-        assert!(!pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_err());
     }
 
     // Quasi-complete rule in isolation: 0 -> 1 -> 2 means forcing 0 in
@@ -507,7 +511,7 @@ mod tests {
         af.add_attack(6, 5);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         println!("{}", node);
         assert!(node.contains(2), "2 is defended once 0 defeats its attacker 1");
@@ -530,7 +534,7 @@ mod tests {
         af.add_attack(0, 2);
         let mut node = Node::new(&af);
 
-        assert!(!pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_err());
     }
 
     // Mixed defeat routes: 3's two attackers are each known defeated by a
@@ -554,7 +558,7 @@ mod tests {
         af.add_attack(5, 4);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         println!("{}", node);
         assert!(node.contains(3), "3's attackers are defeated by one route each");
@@ -579,7 +583,7 @@ mod tests {
         af.add_attack(4, 3);
         let mut node = Node::new(&af);
 
-        assert!(pseudo_complete(vec![0], &mut node, &af));
+        assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         println!("{}", node);
         assert!(node.contains(2), "2 is 1's only possible defender");
