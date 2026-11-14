@@ -8,6 +8,7 @@ mod io;
 
 use std::collections::HashSet;
 use crate::algorithms::complete::dc_co;
+use crate::algorithms::stable::{dc_st, se_st};
 use crate::io::af_parser::read_af;
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -16,6 +17,8 @@ enum Problem {
     DcCo,
     #[value(name = "DC-ST")]
     DcSt,
+    #[value(name = "SE-ST")]
+    SeSt,
     #[value(name = "SE-PR")]
     SePr,
     /// Verify that a given extension is complete
@@ -59,10 +62,29 @@ struct Params {
     )]
     extension: Option<std::path::PathBuf>,
 
-    /// Print search-tree size diagnostics (nodes visited, pseudo_complete
-    /// calls) to stderr as the solver runs
+    /// Print search diagnostics (decisions, conflicts, learned clauses) to
+    /// stderr as the solver runs
     #[arg(short = 'v', long = "verbose")]
     verbose: bool,
+}
+
+/// Print an extension in ICCMA format -- "YES" and a line "w" with its
+/// arguments, 1-indexed -- or "NO" if there is none
+fn print_extension(extension: Option<HashSet<usize>>) {
+    match extension {
+        Some(extension) => {
+            let mut extension: Vec<usize> = extension.into_iter().map(|a| a + 1).collect();
+            extension.sort_unstable();
+            let witness = extension
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<_>>()
+                .join(" ");
+            println!("YES");
+            println!("w {witness}");
+        }
+        None => println!("NO"),
+    }
 }
 
 fn main() -> std::io::Result<()> {
@@ -77,33 +99,24 @@ fn main() -> std::io::Result<()> {
     }
 
     match params.problem {
-        Problem::DcCo => {
-            let arg = params.argument.unwrap();
-            if arg == 0 {
-                panic!("Argument id must be >= 1");
-            }
+        Problem::DcCo | Problem::DcSt | Problem::SeSt => {
+            let argument = params.argument.map(|arg| {
+                if arg == 0 {
+                    panic!("Argument id must be >= 1");
+                }
+                arg - 1
+            });
             let solve_timer = ExecutionTime::start();
-            let result = dc_co(&af, arg - 1, params.verbose);
+            let result = match params.problem {
+                Problem::DcCo => dc_co(&af, argument.unwrap(), params.verbose),
+                Problem::DcSt => dc_st(&af, argument.unwrap(), params.verbose),
+                Problem::SeSt => se_st(&af, params.verbose),
+                _ => unreachable!(),
+            };
             if params.verbose {
                 println!("Solving time: {}", solve_timer.get_elapsed_time());
             }
-            match result {
-                Some(extension) => {
-                    let mut extension: Vec<usize> = extension.into_iter().map(|a| a + 1).collect();
-                    extension.sort_unstable();
-                    let witness = extension
-                        .iter()
-                        .map(|a| a.to_string())
-                        .collect::<Vec<_>>()
-                        .join(" ");
-                    println!("YES");
-                    println!("w {witness}");
-                }
-                None => println!("NO"),
-            }
-        }
-        Problem::DcSt => {
-            unimplemented!("DC-ST is not yet implemented");
+            print_extension(result);
         }
         Problem::SePr => {
             unimplemented!("SE-PR is not yet implemented");

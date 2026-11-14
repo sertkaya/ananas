@@ -14,14 +14,11 @@ pub enum Value {
 /// so that a conflict can be traced back to the assignments that caused it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reason {
-    /// In by assumption: the query argument, an unattacked argument, or a
-    /// search decision
+    /// Assumed rather than derived: the query, an argument nothing attacks,
+    /// or a search decision. Has no antecedents on the trail.
     Decision,
     /// Out because it attacks itself
     SelfAttack,
-    /// Out because a search candidate's whole subtree failed with it in.
-    /// Like a decision, it has no antecedents on the trail.
-    RuledOut,
     /// Out because it attacks, or is attacked by, the given member
     Member(usize),
     /// In because every one of its attackers is known defeated
@@ -47,6 +44,13 @@ pub enum Lit {
 }
 
 impl Lit {
+    /// The argument the literal is about
+    pub fn arg(self) -> usize {
+        match self {
+            Lit::In(a) | Lit::Out(a) | Lit::Def(a) => a,
+        }
+    }
+
     /// The opposite of an `In` or `Out` literal. `Def` has no opposite:
     /// nothing ever records that an argument must stay undefeated.
     pub fn negated(self) -> Lit {
@@ -67,4 +71,14 @@ pub enum Assignment {
     Unchanged,
     /// The argument already had the opposite value
     Conflict,
+}
+
+/// The semantics an extension is sought under
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Semantics {
+    /// Conflict-free, defends each of its members, and contains every
+    /// argument it defends
+    Complete,
+    /// Complete, and attacks every argument outside it
+    Stable,
 }

@@ -21,8 +21,8 @@ use crate::algorithms::node::Node;
 pub struct Learned {
     /// The literals. The first is the negated first unique implication
     /// point, the only literal at the conflict's decision level -- unless
-    /// arguments were ruled out at that level, which keep their literals
-    /// there too, since being ruled out has no antecedents to resolve.
+    /// more than one argument was assumed at that level, since an
+    /// assumption has no antecedents to resolve and keeps its literal.
     pub literals: Vec<Lit>,
     /// The highest decision level among the literals after the first:
     /// backjumping there leaves the first as the only one not yet false.
@@ -33,25 +33,18 @@ pub struct Learned {
     pub unminimized_len: usize,
 }
 
-/// The argument a literal is about
-pub fn arg_of(lit: Lit) -> usize {
-    match lit {
-        Lit::In(a) | Lit::Out(a) | Lit::Def(a) => a,
-    }
-}
-
 /// The literal that held when `b` became known defeated, standing in for
 /// `Def(b)` itself
 fn def_antecedent(b: usize, node: &Node) -> Lit {
-    Lit::In(node.def_source(b))
+    node.def_source(b)
 }
 
 /// Push to `out` the literals that implied giving `arg` a value for
 /// `reason`, all true when it was given. Returns `false`, pushing nothing,
-/// for an assumption -- a decision or a ruling-out -- which has none.
+/// for an assumption, which has none.
 fn antecedents(arg: usize, reason: Reason, node: &Node, af: &AF, out: &mut Vec<Lit>) -> bool {
     match reason {
-        Reason::Decision | Reason::RuledOut => return false,
+        Reason::Decision => return false,
         // Out from the start, at level 0, so never part of a clause
         Reason::SelfAttack => {}
         Reason::Member(m) => out.push(Lit::In(m)),
@@ -64,7 +57,7 @@ fn antecedents(arg: usize, reason: Reason, node: &Node, af: &AF, out: &mut Vec<L
         }
         Reason::Clause(idx) => {
             out.extend(
-                node.clauses().clause(idx).iter().filter(|&&l| arg_of(l) != arg).map(|&l| l.negated()),
+                node.clauses().clause(idx).iter().filter(|&&l| l.arg() != arg).map(|&l| l.negated()),
             );
         }
     }
@@ -126,7 +119,7 @@ impl Analyzer {
     /// the literals still to resolve at the conflict level, 0 if it was
     /// already seen, holds at level 0, or went into the clause.
     fn mark(&mut self, lit: Lit, level: usize, node: &Node, literals: &mut Vec<Lit>) -> usize {
-        let a = arg_of(lit);
+        let a = lit.arg();
         let lit_level = node.level(a);
         if lit_level == 0 || self.seen[a] {
             return 0;
@@ -161,12 +154,12 @@ impl Analyzer {
             let mut failed = !explained;
             if explained {
                 for &lit in &buffer {
-                    let y = arg_of(lit);
+                    let y = lit.arg();
                     let y_level = node.level(y);
                     if y_level == 0 || self.seen[y] {
                         continue;
                     }
-                    let assumed = matches!(node.reason(y), Reason::Decision | Reason::RuledOut);
+                    let assumed = node.reason(y) == Reason::Decision;
                     if assumed || abstract_levels & (1 << (y_level % 64)) == 0 {
                         failed = true;
                         break;
@@ -212,7 +205,7 @@ impl Analyzer {
                 unminimized_len: 0,
             });
         };
-        let level = conflict_lits.iter().map(|&l| node.level(arg_of(l))).max().unwrap_or(0);
+        let level = conflict_lits.iter().map(|&l| node.level(l.arg())).max().unwrap_or(0);
         if level == 0 {
             return Some(Learned { literals: Vec::new(), assertion_level: 0, unminimized_len: 0 });
         }
@@ -249,8 +242,8 @@ impl Analyzer {
                     pending += self.mark(antecedent, level, node, &mut literals);
                 }
             } else {
-                // A ruling-out at the conflict level: nothing to resolve it
-                // with, so it stays.
+                // A further assumption at the conflict level: nothing to
+                // resolve it with, so it stays.
                 literals.push(lit.negated());
             }
             self.buffer = buffer;
@@ -259,11 +252,11 @@ impl Analyzer {
         // Minimize: drop every literal whose assignment the others imply.
         let unminimized_len = literals.len() + 1;
         let abstract_levels = literals.iter()
-            .fold(0u64, |bits, &l| bits | 1 << (node.level(arg_of(l)) % 64));
+            .fold(0u64, |bits, &l| bits | 1 << (node.level(l.arg()) % 64));
         let mut kept = Vec::with_capacity(literals.len() + 1);
         kept.push(uip.negated());
         for lit in literals {
-            if !self.redundant(arg_of(lit), abstract_levels, node, af) {
+            if !self.redundant(lit.arg(), abstract_levels, node, af) {
                 kept.push(lit);
             }
         }
@@ -274,7 +267,7 @@ impl Analyzer {
         self.touched.clear();
 
         let assertion_level = kept[1..].iter()
-            .map(|&l| node.level(arg_of(l)))
+            .map(|&l| node.level(l.arg()))
             .max()
             .unwrap_or(0);
         Some(Learned { literals: kept, assertion_level, unminimized_len })
@@ -285,8 +278,15 @@ impl Analyzer {
 mod tests {
     use super::*;
     use std::collections::HashSet;
-    use crate::algorithms::closure::{assign_literal, backtrack_to_level, propagate, pseudo_complete, rule_out};
+    use crate::algorithms::closure::{assign_literal, backtrack_to_level, propagate, pseudo_complete};
     use crate::algorithms::complete::dc_co;
+    use crate::algorithms::lit::Semantics;
+
+    /// Assume `arg` out, as the search's clauses may make it, and propagate
+    fn assume_out(arg: usize, node: &mut Node, af: &AF) -> Result<(), Conflict> {
+        assign_literal(Lit::Out(arg), Reason::Decision, node)?;
+        propagate(node, af)
+    }
     use crate::algorithms::random_af::{random_af, Rng};
 
     fn analyze(conflict: Conflict, node: &Node, af: &AF) -> Option<Learned> {
@@ -314,7 +314,7 @@ mod tests {
     /// A node with `query` and the unattacked arguments assumed in at
     /// level 0, the way dc_co starts, and the outcome of closing it
     fn root(af: &AF, query: usize) -> (Node, Result<(), Conflict>) {
-        let mut node = Node::new(af);
+        let mut node = Node::new(af, Semantics::Complete);
         let mut seeds = vec![query];
         seeds.extend((0..af.argument_count()).filter(|&a| af.attacker_count(a) == 0));
         let result = pseudo_complete(seeds, &mut node, af);
@@ -333,7 +333,7 @@ mod tests {
         node.new_level();
         for &lit in literals {
             let result = match lit {
-                Lit::In(a) => rule_out(a, &mut node, af),
+                Lit::In(a) => assume_out(a, &mut node, af),
                 Lit::Out(a) => pseudo_complete(vec![a], &mut node, af),
                 Lit::Def(_) => unreachable!("learned clauses have no Def literals"),
             };
@@ -384,31 +384,6 @@ mod tests {
             .count()
     }
 
-    /// Check the learned clauses against the assignment: none is falsified,
-    /// none is unit without having been propagated, and every assignment a
-    /// clause forced is the clause's only literal that is not false
-    fn check_clauses(node: &Node) {
-        for idx in 0..node.clauses().clause_count() {
-            let clause = node.clauses().clause(idx);
-            let is_true = |l: &&Lit| node.lit_value(**l) == Some(true);
-            let undecided = |l: &&Lit| node.lit_value(**l).is_none();
-            let trues = clause.iter().filter(is_true).count();
-            let undecideds = clause.iter().filter(undecided).count();
-            assert!(trues + undecideds > 0, "clause {idx} {clause:?} is falsified");
-            assert!(trues > 0 || undecideds > 1, "clause {idx} {clause:?} is unit but not propagated");
-        }
-        for a in 0..node.value_count() {
-            if let (true, Reason::Clause(idx)) = (node.value(a) != Value::Undecided, node.reason(a)) {
-                let others_false = node.clauses().clause(idx).iter()
-                    .filter(|&&l| arg_of(l) != a)
-                    .all(|&l| node.lit_value(l) == Some(false));
-                let own_true = node.clauses().clause(idx).iter()
-                    .any(|&l| arg_of(l) == a && node.lit_value(l) == Some(true));
-                assert!(others_false && own_true, "{a} is forced by clause {idx} wrongly");
-            }
-        }
-    }
-
     /// Three mutual-attack pairs (0,1), (2,3), (4,5) and nothing forced at
     /// the root, with the clause "0, 2 or 4 is in" learned; deciding 1 and
     /// then 3 puts 0 and 2 out
@@ -417,7 +392,7 @@ mod tests {
         for (a, b) in [(0, 1), (1, 0), (2, 3), (3, 2), (4, 5), (5, 4)] {
             af.add_attack(a, b);
         }
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
         node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
@@ -436,7 +411,7 @@ mod tests {
         assert_eq!(node.reason(4), Reason::Clause(0));
         assert_eq!(node.level(4), 2);
         assert!(node.is_out(5), "and the closure propagates it on");
-        check_clauses(&node);
+        node.check_clauses();
     }
 
     // A clause whose last two literals are falsified in one propagation
@@ -448,7 +423,7 @@ mod tests {
         for (a, b) in [(0, 1), (1, 0), (2, 3), (3, 2), (4, 5), (5, 4), (7, 8), (8, 7), (7, 2), (7, 4)] {
             af.add_attack(a, b);
         }
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
         node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
@@ -471,7 +446,7 @@ mod tests {
         for (a, b) in [(0, 1), (1, 0), (2, 3), (3, 2), (4, 5), (5, 4), (2, 6), (6, 4)] {
             af.add_attack(a, b);
         }
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
         node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
@@ -530,8 +505,8 @@ mod tests {
                     watch_forced += clause_forced_since(&node, before).saturating_sub(1);
                 }
                 Ok(()) => {
-                    check_clauses(&node);
-                    if node.is_self_defending() {
+                    node.check_clauses();
+                    if node.is_self_defending(af) {
                         let extension = node.arguments();
                         assert!(extension.contains(&query) && af.is_complete(&extension),
                             "{extension:?} is not a complete extension with {query}\n{af}");
@@ -559,7 +534,7 @@ mod tests {
         let start = rng.below(n);
         (0..n).map(|k| (start + k) % n).find(|&q| {
             let (node, result) = root(af, q);
-            result.is_ok() && !node.is_self_defending()
+            result.is_ok() && !node.is_self_defending(af)
         })
     }
 
@@ -613,5 +588,112 @@ mod tests {
         assert!(rounds > 500, "too few frameworks needed a search ({rounds})");
         assert!(learned > 1000, "too few clauses learned ({learned})");
         assert!(watch_forced > 100, "too few assignments forced by watches ({watch_forced})");
+    }
+    // A query whose root closure is contradictory gives the empty clause,
+    // and then no complete extension contains it.
+    #[test]
+    fn test_root_conflict_learns_empty_clause() {
+        let mut rng = Rng::new(5);
+        let mut refuted = 0;
+        for _ in 0..1000 {
+            let n = 2 + rng.below(9);
+            let percent = [10, 20, 35, 50][rng.below(4)];
+            let af = random_af(&mut rng, n, percent);
+            let query = rng.below(n);
+            let (node, result) = root(&af, query);
+            let Err(conflict) = result else { continue };
+            let learned = analyze(conflict, &node, &af).expect("level 0 always explains");
+            assert!(learned.literals.is_empty());
+            assert!(extensions_containing(&af, query).is_empty(), "refuted, but YES\n{af}");
+            refuted += 1;
+        }
+        assert!(refuted > 300, "too few refuted queries ({refuted}) to mean much");
+    }
+
+    // On random frameworks, close a query that survives its root closure,
+    // then make random decisions -- and sometimes assume arguments out --
+    // until propagation runs into a conflict, and check the learned
+    // clause: every complete extension containing the query satisfies it
+    // (brute force), assuming it false makes propagation fail again,
+    // the assignment it was learned from falsifies it, and,
+    // when nothing was assumed out at the conflict level, it has exactly one
+    // literal there and asserts below it.
+    #[test]
+    fn test_learned_clauses_random() {
+        let mut rng = Rng::new(4);
+        let mut learned_count = 0;
+        let mut asserting_count = 0;
+        for round in 0..10000 {
+            let n = 2 + rng.below(11);
+            let percent = [10, 20, 35, 50][rng.below(4)];
+            let af = random_af(&mut rng, n, percent);
+            let start = rng.below(n);
+            let Some((query, mut node)) = (0..n)
+                .map(|k| (start + k) % n)
+                .map(|query| (query, root(&af, query)))
+                .find_map(|(query, (node, result))| result.is_ok().then_some((query, node)))
+            else {
+                continue;
+            };
+
+            let mut result = Ok(());
+            let mut ruled_out_at = HashSet::new();
+            while result.is_ok() {
+                let undecided: Vec<usize> = (0..n)
+                    .filter(|&a| node.value(a) == Value::Undecided)
+                    .collect();
+                if undecided.is_empty() {
+                    break;
+                }
+                let c = undecided[rng.below(undecided.len())];
+                // Not at level 0, whose assignments analysis takes as facts
+                if node.decision_level() > 0 && rng.below(4) == 0 {
+                    ruled_out_at.insert(node.decision_level());
+                    result = assume_out(c, &mut node, &af);
+                } else {
+                    node.new_level();
+                    result = pseudo_complete(vec![c], &mut node, &af);
+                }
+            }
+            let Err(conflict) = result else { continue };
+            let learned = analyze(conflict, &node, &af)
+                .expect("search assumptions are only made on undecided arguments");
+            learned_count += 1;
+
+            for extension in &extensions_containing(&af, query) {
+                assert!(
+                    satisfies(extension, &learned.literals),
+                    "round {round}: {:?} excludes the complete extension {extension:?}\n{af}",
+                    learned.literals
+                );
+            }
+            assert!(
+                refuted_by_propagation(&af, query, &learned.literals),
+                "round {round}: {:?} does not follow by propagation\n{af}",
+                learned.literals
+            );
+            for &lit in &learned.literals {
+                let falsified = match lit {
+                    Lit::In(a) => node.is_out(a),
+                    Lit::Out(a) => node.contains(a),
+                    Lit::Def(_) => false,
+                };
+                assert!(falsified, "round {round}: {lit:?} is not false under the assignment");
+            }
+            if learned.literals.is_empty() {
+                continue;
+            }
+            let level = node.level(learned.literals[0].arg());
+            if !ruled_out_at.contains(&level) {
+                let at_level = learned.literals.iter()
+                    .filter(|&&l| node.level(l.arg()) == level)
+                    .count();
+                assert_eq!(at_level, 1, "round {round}: {:?} is not asserting", learned.literals);
+                assert!(learned.assertion_level < level);
+                asserting_count += 1;
+            }
+        }
+        assert!(learned_count > 1000, "too few conflicts ({learned_count}) to mean much");
+        assert!(asserting_count > 500, "too few asserting clauses ({asserting_count})");
     }
 }

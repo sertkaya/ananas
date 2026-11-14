@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use crate::af::AF;
 use crate::algorithms::clauses::ClauseDb;
-use crate::algorithms::lit::{Assignment, Lit, Reason, Value};
+use crate::algorithms::lit::{Assignment, Lit, Reason, Semantics, Value};
 
 /// The search's state: a partial assignment, the trail of assignments that
 /// built it, and the counters the closure rules derive from it.
@@ -23,12 +23,10 @@ pub struct Node {
     // Meaningless for undecided arguments.
     reason: Vec<Reason>,
     level: Vec<usize>,
-    // Number of unattacked attackers for each argument
-    unattacked_attackers_count: Vec<usize>,
     // Number of each argument's attackers whose being in has been
-    // propagated. Its going from 0 to 1 is the argument's defeat, which is
-    // what is propagated to its victims' unattacked_attackers_count; kept as
-    // a count rather than a flag so that undoing it is symmetric.
+    // propagated: the argument is actually defeated by the set so far when
+    // this is positive. Kept as a count rather than a flag so that undoing
+    // it is symmetric.
     in_attackers_count: Vec<usize>,
     // Number of attackers of each argument not yet known to be defeated in
     // every completion of this node's set. An attacker counts as known
@@ -41,9 +39,11 @@ pub struct Node {
     // this node's set, with that fact on the trail for propagation to its
     // own victims' undefeated_attackers_count
     known_defeated: Vec<bool>,
-    // For each argument known defeated, the member that established it:
-    // one the argument attacks or is attacked by. Meaningless otherwise.
-    def_source: Vec<usize>,
+    // For each argument known defeated, the literal that established it:
+    // a member it attacks or is attacked by being in, or -- under stable
+    // semantics, where everything outside the extension is attacked -- its
+    // own being out. Meaningless otherwise.
+    def_source: Vec<Lit>,
     // Number of each argument's attackers whose being out has not yet been
     // propagated. Never less than the number of attackers that could still
     // be added, so for an undefeated attacker of the set it bounds the ways
@@ -61,12 +61,16 @@ pub struct Node {
     level_start: Vec<usize>,
     // The clauses learned so far, with their watches
     clauses: ClauseDb,
+    // The semantics the extension is sought under, which decides whether
+    // every out argument has to be attacked
+    semantics: Semantics,
 }
 
 // Create a new node
 impl Node {
-    /// Create a new node from the initial attacker counts of an AF
-    pub fn new(af: &AF) -> Node {
+    /// Create a new node from the initial attacker counts of an AF, for
+    /// extensions under `semantics`
+    pub fn new(af: &AF, semantics: Semantics) -> Node {
         // A self-attacking argument belongs to no conflict-free set, so it
         // starts out, and is excluded from the usable-defender counts here
         // rather than being propagated later.
@@ -78,23 +82,19 @@ impl Node {
             .collect();
         let reason = vec![Reason::SelfAttack; af.argument_count()];
         let level = vec![0; af.argument_count()];
-        let unattacked_attackers_count = (0..af.argument_count())
-            .map(|a| af.attacker_count(a))
-            .collect();
         let in_attackers_count = vec![0; af.argument_count()];
         let undefeated_attackers_count = (0..af.argument_count())
             .map(|a| af.attacker_count(a))
             .collect();
         let known_defeated = vec![false; af.argument_count()];
-        let def_source = vec![0; af.argument_count()];
+        let def_source = vec![Lit::In(0); af.argument_count()];
         let usable_defenders_count = (0..af.argument_count())
             .map(|a| af.attackers(a).filter(|&&b| !self_attacking[b]).count())
             .collect();
-        Node {
+        let mut node = Node {
             value,
             reason,
             level,
-            unattacked_attackers_count,
             in_attackers_count,
             undefeated_attackers_count,
             known_defeated,
@@ -104,7 +104,24 @@ impl Node {
             propagated: 0,
             level_start: Vec::new(),
             clauses: ClauseDb::new(af.argument_count()),
+            semantics,
+        };
+        if semantics == Semantics::Stable {
+            // A stable extension attacks everything outside it, including
+            // the self-attackers, so they are defeated in every extension
+            // from the start. On the trail, at level 0, for the first
+            // propagation to draw the consequences -- an attacker to defend
+            // against, or none, in which case there is no stable extension.
+            for a in (0..af.argument_count()).filter(|&a| self_attacking[a]) {
+                node.assign_def(a, Lit::Out(a));
+            }
         }
+        node
+    }
+
+    /// The semantics the extension is sought under
+    pub fn semantics(&self) -> Semantics {
+        self.semantics
     }
 
     /// Whether a literal is true or false under the assignment, or `None`
@@ -169,6 +186,9 @@ impl Node {
     /// Drop every decision level above `level`, returning the length the
     /// trail had when the first of them began -- what to backtrack it to
     pub fn drop_levels_above(&mut self, level: usize) -> usize {
+        if level >= self.level_start.len() {
+            return self.trail.len();
+        }
         let len = self.level_start[level];
         self.level_start.truncate(level);
         len
@@ -237,21 +257,6 @@ impl Node {
         self.value[arg] == Value::Out
     }
 
-    /// Get the number of unattacked (undefeated) attackers of an argument
-    pub fn unattacked_attackers_count(&self, arg: usize) -> usize {
-        self.unattacked_attackers_count[arg]
-    }
-
-    /// Decrement the number of unattacked attackers of an argument
-    pub fn decrement_unattacked_attackers(&mut self, arg: usize) {
-        self.unattacked_attackers_count[arg] -= 1;
-    }
-
-    /// Increment the number of unattacked attackers of an argument
-    pub fn increment_unattacked_attackers(&mut self, arg: usize) {
-        self.unattacked_attackers_count[arg] += 1;
-    }
-
     /// Get the bound on the number of `arg`'s attackers that could still
     /// be added to the set -- for an undefeated attacker of the set, the
     /// number of ways left to defend against it
@@ -275,26 +280,20 @@ impl Node {
         af.attackers(arg).any(|&a| self.contains(a))
     }
 
-    /// Check whether `arg`'s defeat has already been propagated to its own
-    /// victims' unattacked_attackers_count. `arg` being defeated is a
-    /// one-time fact regardless of how many of its attackers are accepted,
-    /// so it is propagated with the first of them and undone with the last.
+    /// Check whether `arg` is actually defeated by the set so far, i.e. an
+    /// attacker of it has been propagated in
     pub fn defeat_propagated(&self, arg: usize) -> bool {
         self.in_attackers_count[arg] > 0
     }
 
-    /// Count one more of `arg`'s attackers as propagated in, and return
-    /// whether it is the first -- i.e. whether `arg`'s defeat is new
-    pub fn add_in_attacker(&mut self, arg: usize) -> bool {
+    /// Count one more of `arg`'s attackers as propagated in
+    pub fn add_in_attacker(&mut self, arg: usize) {
         self.in_attackers_count[arg] += 1;
-        self.in_attackers_count[arg] == 1
     }
 
-    /// Count one fewer of `arg`'s attackers as propagated in, and return
-    /// whether it was the last -- i.e. whether `arg`'s defeat is undone
-    pub fn remove_in_attacker(&mut self, arg: usize) -> bool {
+    /// Count one fewer of `arg`'s attackers as propagated in
+    pub fn remove_in_attacker(&mut self, arg: usize) {
         self.in_attackers_count[arg] -= 1;
-        self.in_attackers_count[arg] == 0
     }
 
     /// Get the number of `arg`'s attackers not yet known to be defeated in
@@ -323,28 +322,30 @@ impl Node {
         self.known_defeated[arg]
     }
 
-    /// Get the member that established `arg` as defeated in every
+    /// Get the literal that established `arg` as defeated in every
     /// completion. Meaningless unless `arg` is known defeated.
-    pub fn def_source(&self, arg: usize) -> usize {
+    pub fn def_source(&self, arg: usize) -> Lit {
         self.def_source[arg]
     }
 
-    /// Record that `arg` is defeated in every completion because of
-    /// `member`, appending it to the trail. Does nothing if it was already
+    /// Record that `arg` is defeated in every completion because `source`
+    /// holds, appending it to the trail. Does nothing if it was already
     /// known.
-    pub fn assign_def(&mut self, arg: usize, member: usize) {
+    pub fn assign_def(&mut self, arg: usize, source: Lit) {
         if !self.known_defeated[arg] {
             self.known_defeated[arg] = true;
-            self.def_source[arg] = member;
+            self.def_source[arg] = source;
             self.trail.push(Lit::Def(arg));
         }
     }
 
     /// Check whether every argument in this node's set is defended by the
-    /// set itself, i.e. has no unattacked (undefeated) attackers left
-    pub fn is_self_defending(&self) -> bool {
-        self.value.iter().zip(&self.unattacked_attackers_count)
-            .all(|(&value, &count)| value != Value::In || count == 0)
+    /// set itself, i.e. every attacker of a member is attacked by a member
+    #[cfg(test)]
+    pub fn is_self_defending(&self, af: &AF) -> bool {
+        (0..self.value.len()).all(|a| {
+            self.value[a] != Value::In || af.attackers(a).all(|&b| self.defeat_propagated(b))
+        })
     }
 
     /// Collect the set of arguments currently in this node's set
@@ -370,7 +371,6 @@ impl Node {
                 assert_eq!(self.def_source[a], other.def_source[a], "def sources of {a} differ");
             }
         }
-        assert_eq!(self.unattacked_attackers_count, other.unattacked_attackers_count);
         assert_eq!(self.in_attackers_count, other.in_attackers_count);
         assert_eq!(self.undefeated_attackers_count, other.undefeated_attackers_count);
         assert_eq!(self.known_defeated, other.known_defeated);
@@ -391,10 +391,8 @@ impl Display for Node {
             }
         }
         writeln!(f)?;
-        for (index, count) in self.unattacked_attackers_count.iter().enumerate() {
-            write!(f, "{}: ", index)?;
-            write!(f, "{} ", count)?;
-            writeln!(f)?;
+        for (index, value) in self.value.iter().enumerate() {
+            writeln!(f, "{}: {:?}", index, value)?;
         }
         Ok(())
     }
@@ -411,7 +409,7 @@ mod tests {
         let input_af = File::open("tests/jelia23-example.af")?;
         let af = read_af(input_af);
         println!("{}", af);
-        let node = Node::new(&af);
+        let node = Node::new(&af, Semantics::Complete);
         println!("{}", node);
         Ok(())
     }

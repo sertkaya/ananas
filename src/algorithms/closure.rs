@@ -1,6 +1,6 @@
 use crate::af::AF;
 use crate::algorithms::clauses::propagate_clauses;
-use crate::algorithms::lit::{Assignment, Lit, Reason, Value};
+use crate::algorithms::lit::{Assignment, Lit, Reason, Semantics, Value};
 use crate::algorithms::node::Node;
 
 /// A contradiction that propagation ran into
@@ -81,16 +81,10 @@ fn apply(lit: Lit, node: &mut Node, af: &AF) {
     match lit {
         Lit::In(m) => {
             // A member attacks each victim, so it is actually defeated by
-            // the set so far, which is what the defended-check used by
-            // is_self_defending and candidates counts. Propagated with the
-            // first member that attacks it, so that one defeated attacker
-            // is never counted twice.
+            // the set so far -- which is what tells the search whether an
+            // argument that must be defeated still needs a defender.
             for &v in af.victims(m) {
-                if node.add_in_attacker(v) {
-                    for &w in af.victims(v) {
-                        node.decrement_unattacked_attackers(w);
-                    }
-                }
+                node.add_in_attacker(v);
             }
         }
         Lit::Out(c) => {
@@ -114,11 +108,7 @@ fn unapply(lit: Lit, node: &mut Node, af: &AF) {
     match lit {
         Lit::In(m) => {
             for &v in af.victims(m) {
-                if node.remove_in_attacker(v) {
-                    for &w in af.victims(v) {
-                        node.increment_unattacked_attackers(w);
-                    }
-                }
+                node.remove_in_attacker(v);
             }
         }
         Lit::Out(c) => {
@@ -143,7 +133,8 @@ fn unapply(lit: Lit, node: &mut Node, af: &AF) {
 /// arguments as soon as either a member attacks `b` (semi-complete) or `b`
 /// attacks a member, since a complete extension defends its members and so
 /// must attack `b` back (quasi-complete). Either way `b` is out and `Def(b)`
-/// holds. Once all of some argument's attackers are known defeated, it is
+/// holds. Under stable semantics every out argument is defeated, so there
+/// `Def(b)` follows from `Out(b)` alone. Once all of some argument's attackers are known defeated, it is
 /// defended in every completion and is put in, whether or not it is
 /// defended *yet* -- and since both routes feed the same counter, an
 /// argument whose attackers are covered by a mixture of them is put in too.
@@ -173,17 +164,22 @@ pub fn propagate(node: &mut Node, af: &AF) -> Result<(), Conflict> {
                     // Semi-complete: `v` conflicts with the set and is
                     // defeated in every completion.
                     set_out(v, Reason::Member(m), node)?;
-                    node.assign_def(v, m);
+                    node.assign_def(v, Lit::In(m));
                 }
                 for &b in af.attackers(m) {
                     // Quasi-complete: `b` conflicts with the set, and any
                     // completion must defend `m` by attacking `b` back.
                     set_out(b, Reason::Member(m), node)?;
-                    node.assign_def(b, m);
+                    node.assign_def(b, Lit::In(m));
                 }
                 propagate_clauses(lit, node)?;
             }
             Lit::Out(c) => {
+                if node.semantics() == Semantics::Stable {
+                    // A stable extension attacks everything outside it, so
+                    // `c` must be defeated in every completion too.
+                    node.assign_def(c, Lit::Out(c));
+                }
                 for &v in af.victims(c) {
                     resolve_defenders(v, node, af)?;
                 }
@@ -234,24 +230,18 @@ pub fn pseudo_complete(seeds: Vec<usize>, node: &mut Node, af: &AF) -> Result<()
     propagate(node, af)
 }
 
-/// Rule `arg` out of `node`'s set, and propagate the consequences. Used
-/// when a candidate's whole subtree has failed: it must never come back in
-/// this branch, not even as a side effect of some other candidate's
-/// closure.
-///
-/// Fails if that runs into a conflict, leaving `node` contradictory until
-/// it is backtracked to before the ruling-out.
-pub fn rule_out(arg: usize, node: &mut Node, af: &AF) -> Result<(), Conflict> {
-    set_out(arg, Reason::RuledOut, node)?;
-    propagate(node, af)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs::File;
     use crate::io::af_parser::read_af;
     use crate::algorithms::random_af::{random_af, Rng};
+
+    /// Assume `arg` out, as the search's clauses may make it, and propagate
+    fn assume_out(arg: usize, node: &mut Node, af: &AF) -> Result<(), Conflict> {
+        assign_literal(Lit::Out(arg), Reason::Decision, node)?;
+        propagate(node, af)
+    }
 
     /// Check that every assignment in a node `propagate` has finished with
     /// is justified by its recorded reason, and that the node is a fixpoint
@@ -273,7 +263,7 @@ mod tests {
                     );
                 }
                 (Value::Out, Reason::SelfAttack) => assert!(af.attacks(a, a)),
-                (Value::Out, Reason::RuledOut) => {}
+                (Value::Out, Reason::Decision) => {}
                 (Value::Out, Reason::Member(m)) => assert!(
                     node.contains(m) && (af.attacks(m, a) || af.attacks(a, m)),
                     "{a} is out for conflicting with {m}, but does not"
@@ -281,11 +271,14 @@ mod tests {
                 (value, reason) => panic!("{a} is {value:?} for {reason:?}"),
             }
             if node.known_defeated(a) {
-                let m = node.def_source(a);
-                assert!(
-                    node.contains(m) && (af.attacks(m, a) || af.attacks(a, m)),
-                    "{a} is known defeated because of {m}, but neither attacks the other"
-                );
+                match node.def_source(a) {
+                    Lit::In(m) => assert!(
+                        node.contains(m) && (af.attacks(m, a) || af.attacks(a, m)),
+                        "{a} is known defeated because of {m}, but neither attacks the other"
+                    ),
+                    Lit::Out(x) => assert!(x == a && node.semantics() == Semantics::Stable),
+                    Lit::Def(_) => unreachable!(),
+                }
                 assert!(node.is_out(a), "{a} is known defeated but not out");
             }
 
@@ -306,7 +299,7 @@ mod tests {
     }
 
     // Backtracking restores the node exactly -- values, counters, trail --
-    // after any mix of decisions and ruling-outs on random frameworks,
+    // after any mix of in and out assumptions on random frameworks,
     // including ones that ended in a conflict partway through propagating.
     #[test]
     fn test_backtrack_restores_state_random() {
@@ -316,13 +309,13 @@ mod tests {
             let n = 2 + rng.below(11);
             let percent = [10, 20, 35, 50][rng.below(4)];
             let af = random_af(&mut rng, n, percent);
-            let mut node = Node::new(&af);
+            let mut node = Node::new(&af, Semantics::Complete);
             let mut seeds = vec![rng.below(n)];
             seeds.extend((0..n).filter(|&a| af.attacker_count(a) == 0));
             if pseudo_complete(seeds, &mut node, &af).is_err() {
                 conflicts += 1;
                 backtrack(0, &mut node, &af);
-                node.assert_same_state(&Node::new(&af));
+                node.assert_same_state(&Node::new(&af, Semantics::Complete));
                 continue;
             }
             let snapshot = node.clone();
@@ -338,7 +331,7 @@ mod tests {
                 let consistent = if rng.below(2) == 0 {
                     pseudo_complete(vec![c], &mut node, &af).is_ok()
                 } else {
-                    rule_out(c, &mut node, &af).is_ok()
+                    assume_out(c, &mut node, &af).is_ok()
                 };
                 if !consistent {
                     conflicts += 1;
@@ -352,7 +345,7 @@ mod tests {
     }
 
     // Every assignment the closure makes, on random frameworks seeded the
-    // way dc_co seeds them and then with a further argument ruled out, is
+    // way dc_co seeds them and then with a further argument assumed out, is
     // justified by its reason, and the result is a fixpoint.
     #[test]
     fn test_propagate_reasons_random() {
@@ -362,7 +355,7 @@ mod tests {
             let n = 2 + rng.below(11);
             let percent = [10, 20, 35, 50][rng.below(4)];
             let af = random_af(&mut rng, n, percent);
-            let mut node = Node::new(&af);
+            let mut node = Node::new(&af, Semantics::Complete);
             let mut seeds = vec![rng.below(n)];
             seeds.extend((0..n).filter(|&a| af.attacker_count(a) == 0));
             if pseudo_complete(seeds, &mut node, &af).is_err() {
@@ -375,7 +368,7 @@ mod tests {
                 .collect();
             if !undecided.is_empty() {
                 let c = undecided[rng.below(undecided.len())];
-                if rule_out(c, &mut node, &af).is_ok() {
+                if assume_out(c, &mut node, &af).is_ok() {
                     check_node(&node, &af);
                 }
             }
@@ -395,7 +388,7 @@ mod tests {
     #[test]
     fn test_pseudo_complete() {
         let af = build_af();
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
@@ -413,7 +406,7 @@ mod tests {
     fn test_pseudo_complete_jelia23() -> std::io::Result<()> {
         let input_af = File::open("tests/jelia23-example.af")?;
         let af = read_af(input_af);
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         // Seed the closure the way a real caller would: with the
         // arguments that are unconditionally defended from the start.
@@ -442,7 +435,7 @@ mod tests {
     fn test_pseudo_complete_mutual_attack_cycle() -> std::io::Result<()> {
         let input_af = File::open("tests/jelia23-example.af")?;
         let af = read_af(input_af);
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
@@ -465,7 +458,7 @@ mod tests {
         af.add_attack(0, 1);
         af.add_attack(1, 2);
         af.add_attack(2, 0);
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         assert!(pseudo_complete(vec![0], &mut node, &af).is_err());
     }
@@ -484,7 +477,7 @@ mod tests {
         af.add_attack(2, 3);
         af.add_attack(4, 3);
         af.add_attack(4, 4);
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         assert!(pseudo_complete(vec![0, 1], &mut node, &af).is_ok());
 
@@ -493,16 +486,16 @@ mod tests {
     }
 
     // 0 -> 1 -> 2: forcing 0 in organically pulls in 2 (via 1's defeat), with
-    // no direct conflict. If 2 has already been ruled out (e.g.
-    // a previously-failed search hypothesis), the closure must still reject
-    // it, even though 2 does not conflict with anything in the set.
+    // no direct conflict. If 2 is already out (e.g. by a learned clause),
+    // the closure must still reject it, even though 2 does not conflict with
+    // anything in the set.
     #[test]
-    fn test_pseudo_complete_ruled_out() {
+    fn test_pseudo_complete_already_out() {
         let mut af = AF::new(3);
         af.add_attack(0, 1);
         af.add_attack(1, 2);
-        let mut node = Node::new(&af);
-        assert!(rule_out(2, &mut node, &af).is_ok());
+        let mut node = Node::new(&af, Semantics::Complete);
+        assert!(assume_out(2, &mut node, &af).is_ok());
 
         assert!(pseudo_complete(vec![0], &mut node, &af).is_err());
     }
@@ -529,7 +522,7 @@ mod tests {
         af.add_attack(6, 3);
         af.add_attack(5, 6);
         af.add_attack(6, 5);
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
@@ -552,7 +545,7 @@ mod tests {
         af.add_attack(1, 0);
         af.add_attack(2, 1);
         af.add_attack(0, 2);
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         assert!(pseudo_complete(vec![0], &mut node, &af).is_err());
     }
@@ -576,7 +569,7 @@ mod tests {
         af.add_attack(5, 2);
         af.add_attack(4, 5);
         af.add_attack(5, 4);
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
@@ -601,13 +594,13 @@ mod tests {
         af.add_attack(2, 1);
         af.add_attack(3, 2);
         af.add_attack(4, 3);
-        let mut node = Node::new(&af);
+        let mut node = Node::new(&af, Semantics::Complete);
 
         assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         println!("{}", node);
         assert!(node.contains(2), "2 is 1's only possible defender");
         assert!(node.contains(4), "4 is 3's only possible defender");
-        assert!(node.is_self_defending());
+        assert!(node.is_self_defending(&af));
     }
 }

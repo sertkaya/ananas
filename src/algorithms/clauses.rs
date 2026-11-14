@@ -31,8 +31,6 @@ impl ClauseDb {
     /// Store a learned clause, watching its first two literals, and return
     /// its index. A clause of fewer than two literals gets no watches: it is
     /// either empty, or a unit the caller asserts at level 0 for good.
-    // Not called outside tests until the search learns
-    #[allow(dead_code)]
     pub fn add_clause(&mut self, literals: Vec<Lit>) -> usize {
         let idx = self.clauses.len();
         if literals.len() >= 2 {
@@ -95,8 +93,6 @@ impl ClauseDb {
     }
 
     /// Get the number of learned clauses stored
-    // Not called outside tests until the search learns
-    #[allow(dead_code)]
     pub fn clause_count(&self) -> usize {
         self.clauses.len()
     }
@@ -159,4 +155,31 @@ pub fn propagate_clauses(assigned: Lit, node: &mut Node) -> Result<(), Conflict>
     }
     node.clauses_mut().put_watches(assigned, list);
     result
+}
+
+#[cfg(test)]
+impl Node {
+    /// Check the learned clauses against the assignment: none is falsified,
+    /// none is unit without having been propagated, and every assignment a
+    /// clause forced is the clause's only literal that is not false
+    pub fn check_clauses(&self) {
+        use crate::algorithms::lit::Value;
+        for idx in 0..self.clauses().clause_count() {
+            let clause = self.clauses().clause(idx);
+            let trues = clause.iter().filter(|&&l| self.lit_value(l) == Some(true)).count();
+            let undecideds = clause.iter().filter(|&&l| self.lit_value(l).is_none()).count();
+            assert!(trues + undecideds > 0, "clause {idx} {clause:?} is falsified");
+            assert!(trues > 0 || undecideds > 1, "clause {idx} {clause:?} is unit but not propagated");
+        }
+        for a in 0..self.value_count() {
+            if let (true, Reason::Clause(idx)) = (self.value(a) != Value::Undecided, self.reason(a)) {
+                let clause = self.clauses().clause(idx);
+                let others_false = clause.iter()
+                    .filter(|&&l| l.arg() != a)
+                    .all(|&l| self.lit_value(l) == Some(false));
+                let own_true = clause.iter().any(|&l| l.arg() == a && self.lit_value(l) == Some(true));
+                assert!(others_false && own_true, "{a} is forced by clause {idx} wrongly");
+            }
+        }
+    }
 }
