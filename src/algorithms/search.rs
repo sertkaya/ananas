@@ -9,10 +9,13 @@
 //! can be asked again with a larger set of assumptions and keep them.
 
 use std::collections::HashSet;
+use std::time::Instant;
 use crate::af::AF;
-use crate::algorithms::closure::{assign_literal, backtrack_to_level, propagate, pseudo_complete};
+use crate::algorithms::clauses::ClauseWork;
+use crate::algorithms::closure::{assign_literal, backtrack_to_level, propagate_counting, pseudo_complete};
 use crate::algorithms::learning::Analyzer;
-use crate::algorithms::lit::{Reason, Semantics, Value};
+use crate::algorithms::closure::Conflict;
+use crate::algorithms::lit::{Lit, Reason, Semantics, Value};
 use crate::algorithms::node::Node;
 use crate::algorithms::stats::Stats;
 
@@ -28,7 +31,18 @@ pub struct Solver<'a> {
     // belong to every extension, and go in with the first call's
     // assumptions at level 0.
     started: bool,
+    // The number of conflicts at which the clause database is next reduced
+    next_reduction: usize,
 }
+
+// Learned clauses are reduced for the first time after this many
+// conflicts, and then after this many more plus REDUCTION_GROWTH per
+// reduction so far, so that the database is allowed to grow slowly.
+const FIRST_REDUCTION: usize = 2000;
+const REDUCTION_GROWTH: usize = 300;
+// A clause spanning no more decision levels than this is kept for good: it
+// ties few blocks of assignments together, so it keeps becoming unit.
+const GLUE_LBD: usize = 2;
 
 impl<'a> Solver<'a> {
     /// A solver for `af` under `semantics`. If `verbose`, it prints its
@@ -41,12 +55,52 @@ impl<'a> Solver<'a> {
             stats: Stats::default(),
             verbose,
             started: false,
+            next_reduction: FIRST_REDUCTION,
         }
+    }
+
+    /// Delete the less promising half of the learned clauses: the ones
+    /// spanning the most decision levels, oldest first among equals. Kept
+    /// regardless are glue clauses, and the clauses that are the reason
+    /// for an assignment on the trail, which analysis may still need.
+    fn reduce_clauses(&mut self) {
+        let db = self.node.clauses();
+        let mut locked = vec![false; db.clause_count()];
+        for &lit in self.node.trail() {
+            if let Lit::In(a) | Lit::Out(a) = lit
+                && let Reason::Clause(idx) = self.node.reason(a)
+            {
+                locked[idx] = true;
+            }
+        }
+        let mut removable: Vec<(usize, usize)> = (0..db.clause_count())
+            .filter(|&idx| db.is_live(idx) && !locked[idx] && db.lbd(idx) > GLUE_LBD && db.clause(idx).len() >= 2)
+            .map(|idx| (db.lbd(idx), idx))
+            .collect();
+        // Worst first: highest LBD, and among equals the oldest
+        removable.sort_unstable_by_key(|&(lbd, idx)| (std::cmp::Reverse(lbd), idx));
+        removable.truncate(removable.len() / 2);
+        let mut doomed = vec![false; db.clause_count()];
+        for &(_, idx) in &removable {
+            doomed[idx] = true;
+        }
+        let deleted = self.node.clauses_mut().reduce(|idx, _, _| doomed[idx]);
+        self.stats.reductions += 1;
+        self.stats.deleted += deleted;
+        self.stats.clauses = self.node.clauses().live_count();
     }
 
     /// The diagnostics gathered so far
     pub fn stats(&self) -> &Stats {
         &self.stats
+    }
+
+    /// Reduce the clause database for the first time after `conflicts`
+    /// conflicts instead of the default, to exercise reductions on small
+    /// frameworks
+    #[cfg(test)]
+    pub fn set_first_reduction(&mut self, conflicts: usize) {
+        self.next_reduction = conflicts;
     }
 
     /// Find an extension that contains `assumptions` -- and everything
@@ -55,6 +109,7 @@ impl<'a> Solver<'a> {
     /// if there is no such extension.
     pub fn solve(&mut self, assumptions: &[usize]) -> Option<HashSet<usize>> {
         let af = self.af;
+        let started_at = Instant::now();
         backtrack_to_level(0, &mut self.node, af);
 
         let mut seeds = assumptions.to_vec();
@@ -68,11 +123,18 @@ impl<'a> Solver<'a> {
         loop {
             match result {
                 Err(conflict) => {
+                    let started = Instant::now();
                     let learned = self.analyzer.analyze(conflict, &self.node, af)
                         .expect("decisions are only made on undecided arguments");
+                    self.stats.analysing += started.elapsed();
                     self.stats.record_learned(&learned, self.node.decision_level());
                     if self.verbose && self.stats.conflicts.is_multiple_of(1000) {
-                        eprintln!("[progress] {} level={}", self.stats, self.node.decision_level());
+                        eprintln!(
+                            "[progress] t={:.1}s {} level={}",
+                            started_at.elapsed().as_secs_f64(),
+                            self.stats,
+                            self.node.decision_level()
+                        );
                     }
                     if learned.literals.is_empty() {
                         // Contradictory at level 0: the assumptions
@@ -83,27 +145,52 @@ impl<'a> Solver<'a> {
                     // yet false, and make that one true. A unit clause has
                     // no watches, and its literal, asserted at level 0, is
                     // never undone.
+                    let started = Instant::now();
                     backtrack_to_level(learned.assertion_level, &mut self.node, af);
+                    self.stats.backtracking += started.elapsed();
                     let first = learned.literals[0];
-                    let idx = self.node.clauses_mut().add_clause(learned.literals);
-                    self.stats.clauses = self.node.clauses().clause_count();
-                    self.stats.propagations += 1;
+                    let idx = self.node.clauses_mut().add_clause(learned.literals, learned.lbd);
+                    self.stats.clauses = self.node.clauses().live_count();
                     result = assign_literal(first, Reason::Clause(idx), &mut self.node)
-                        .and_then(|()| propagate(&mut self.node, af));
+                        .and_then(|()| self.propagate());
                 }
                 Ok(()) => {
                     #[cfg(test)]
                     self.node.check_clauses();
-                    let Some(c) = self.decide() else {
+                    if self.stats.conflicts >= self.next_reduction {
+                        self.reduce_clauses();
+                        #[cfg(test)]
+                        self.node.check_clauses();
+                        self.next_reduction = self.stats.conflicts
+                            + FIRST_REDUCTION
+                            + REDUCTION_GROWTH * self.stats.reductions;
+                    }
+                    let started = Instant::now();
+                    let decision = self.decide();
+                    self.stats.deciding += started.elapsed();
+                    let Some(c) = decision else {
                         return Some(self.node.arguments());
                     };
                     self.stats.decisions += 1;
                     self.node.new_level();
-                    self.stats.propagations += 1;
-                    result = pseudo_complete(vec![c], &mut self.node, af);
+                    result = assign_literal(Lit::In(c), Reason::Decision, &mut self.node)
+                        .and_then(|()| self.propagate());
                 }
             }
         }
+    }
+
+    /// Propagate what is queued on the trail, timing it and counting what
+    /// the learned clauses cost
+    fn propagate(&mut self) -> Result<(), Conflict> {
+        self.stats.propagations += 1;
+        let started = Instant::now();
+        let mut work = ClauseWork::default();
+        let result = propagate_counting(&mut self.node, self.af, &mut work);
+        self.stats.propagating += started.elapsed();
+        self.stats.clause_visits += work.visits;
+        self.stats.clause_literals_scanned += work.literals_scanned;
+        result
     }
 
     /// The next argument to put in, or `None` if the assignment already is
@@ -149,5 +236,54 @@ impl<'a> Solver<'a> {
             Semantics::Complete => None,
             Semantics::Stable => (0..af.argument_count()).find(|&a| node.value(a) == Value::Undecided),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::algorithms::random_af::{random_af, Rng};
+
+    // Deleting learned clauses changes what the search does, but not what
+    // it answers: with the database reduced every few conflicts the solver
+    // agrees with itself unreduced, on random frameworks large enough for
+    // searches to have many conflicts.
+    #[test]
+    fn test_reduction_keeps_answers() {
+        let mut rng = Rng::new(9);
+        let mut reductions = 0;
+        let mut conflicts = 0;
+        let mut answers = [0, 0];
+        for round in 0..120 {
+            let n = 60 + rng.below(61);
+            let percent = [10, 15][rng.below(2)];
+            let af = random_af(&mut rng, n, percent);
+            let query = rng.below(n);
+            for semantics in [Semantics::Complete, Semantics::Stable] {
+                let mut plain = Solver::new(&af, semantics, false);
+                let expected = plain.solve(&[query]);
+                let mut reducing = Solver::new(&af, semantics, false);
+                reducing.set_first_reduction(5);
+                let answer = reducing.solve(&[query]);
+                assert_eq!(answer.is_some(), expected.is_some(),
+                    "round {round}, {semantics:?}, query {query}: reduced {answer:?} vs {expected:?}\n{af}");
+                if let Some(extension) = &answer {
+                    let valid = match semantics {
+                        Semantics::Complete => af.is_complete(extension),
+                        Semantics::Stable => af.is_stable(extension),
+                    };
+                    assert!(valid && extension.contains(&query), "round {round}: {extension:?}\n{af}");
+                    answers[0] += 1;
+                } else {
+                    answers[1] += 1;
+                }
+                reductions += reducing.stats().reductions;
+                conflicts += reducing.stats().conflicts;
+            }
+        }
+        assert!(reductions > 50, "too few reductions ({reductions}) to mean much");
+        assert!(conflicts > 2000, "too few conflicts ({conflicts}) to mean much");
+        // Random frameworks this dense refute most queries, so YES is rare
+        assert!(answers[0] >= 5 && answers[1] > 50, "answers too one-sided: {answers:?}");
     }
 }

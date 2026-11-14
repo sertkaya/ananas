@@ -5,13 +5,33 @@ use crate::algorithms::closure::{assign_literal, Conflict};
 use crate::algorithms::lit::{Lit, Reason};
 use crate::algorithms::node::Node;
 
+/// How much work propagating the learned clauses did
+#[derive(Debug, Default, Clone, Copy)]
+pub struct ClauseWork {
+    /// Clauses looked at because a watched literal became false
+    pub visits: usize,
+    /// Literals scanned while looking for a replacement watch
+    pub literals_scanned: usize,
+}
+
+/// A learned clause: a disjunction of In/Out literals, and its literal
+/// block distance when it was learned
+#[derive(Debug, Clone)]
+pub struct Clause {
+    // The first two literals are watched: as long as neither is false, the
+    // clause cannot be unit or falsified, so it need not be looked at.
+    // Empty once the clause has been deleted -- it keeps its index, which
+    // reasons on the trail may still name.
+    literals: Vec<Lit>,
+    lbd: usize,
+}
+
 /// The clauses learned so far, each watching two of its literals
 #[derive(Debug, Clone)]
 pub struct ClauseDb {
-    // The clauses: disjunctions of In/Out literals. The first two literals
-    // of each are watched: as long as neither is false, the clause cannot be
-    // unit or falsified, so it need not be looked at.
-    clauses: Vec<Vec<Lit>>,
+    clauses: Vec<Clause>,
+    // How many of them have not been deleted
+    live: usize,
     // For each argument, the clauses watching a literal that its becoming
     // in, respectively out, makes false -- i.e. watching Out(a) and In(a)
     watch_on_in: Vec<Vec<usize>>,
@@ -23,21 +43,62 @@ impl ClauseDb {
     pub fn new(argument_count: usize) -> ClauseDb {
         ClauseDb {
             clauses: Vec::new(),
+            live: 0,
             watch_on_in: vec![Vec::new(); argument_count],
             watch_on_out: vec![Vec::new(); argument_count],
         }
     }
 
-    /// Store a learned clause, watching its first two literals, and return
-    /// its index. A clause of fewer than two literals gets no watches: it is
-    /// either empty, or a unit the caller asserts at level 0 for good.
-    pub fn add_clause(&mut self, literals: Vec<Lit>) -> usize {
+    /// Delete every clause `doomed` says to, and rebuild the watch lists
+    /// from the survivors. Their currently watched literals stay watched:
+    /// whatever held for them before holds after. Returns how many were
+    /// deleted. The caller must not doom a clause that is the reason for an
+    /// assignment still on the trail, nor an empty or unit one.
+    pub fn reduce(&mut self, doomed: impl Fn(usize, &[Lit], usize) -> bool) -> usize {
+        let mut deleted = 0;
+        for idx in 0..self.clauses.len() {
+            let clause = &self.clauses[idx];
+            if !clause.literals.is_empty() && doomed(idx, &clause.literals, clause.lbd) {
+                self.clauses[idx].literals = Vec::new();
+                deleted += 1;
+            }
+        }
+        self.live -= deleted;
+        for list in self.watch_on_in.iter_mut().chain(self.watch_on_out.iter_mut()) {
+            list.clear();
+        }
+        for idx in 0..self.clauses.len() {
+            if self.clauses[idx].literals.len() >= 2 {
+                let (first, second) = (self.clauses[idx].literals[0], self.clauses[idx].literals[1]);
+                self.watch(first, idx);
+                self.watch(second, idx);
+            }
+        }
+        deleted
+    }
+
+    /// Whether clause `idx` is still there
+    pub fn is_live(&self, idx: usize) -> bool {
+        !self.clauses[idx].literals.is_empty()
+    }
+
+    /// The literal block distance of clause `idx` when it was learned
+    pub fn lbd(&self, idx: usize) -> usize {
+        self.clauses[idx].lbd
+    }
+
+    /// Store a learned clause with its literal block distance, watching its
+    /// first two literals, and return its index. A clause of fewer than two
+    /// literals gets no watches: it is either empty, or a unit the caller
+    /// asserts at level 0 for good.
+    pub fn add_clause(&mut self, literals: Vec<Lit>, lbd: usize) -> usize {
         let idx = self.clauses.len();
         if literals.len() >= 2 {
             self.watch(literals[0], idx);
             self.watch(literals[1], idx);
         }
-        self.clauses.push(literals);
+        self.clauses.push(Clause { literals, lbd });
+        self.live += 1;
         idx
     }
 
@@ -82,19 +143,24 @@ impl ClauseDb {
         *slot = list;
     }
 
-    /// Get the literals of clause `idx`
+    /// Get the literals of clause `idx`; none if it has been deleted
     pub fn clause(&self, idx: usize) -> &[Lit] {
-        &self.clauses[idx]
+        &self.clauses[idx].literals
     }
 
     /// Get the literals of clause `idx`, to reorder its watches
     pub fn clause_mut(&mut self, idx: usize) -> &mut Vec<Lit> {
-        &mut self.clauses[idx]
+        &mut self.clauses[idx].literals
     }
 
-    /// Get the number of learned clauses stored
+    /// Get the number of clause indices handed out, deleted ones included
     pub fn clause_count(&self) -> usize {
         self.clauses.len()
+    }
+
+    /// Get the number of learned clauses not deleted
+    pub fn live_count(&self) -> usize {
+        self.live
     }
 }
 
@@ -108,7 +174,10 @@ impl ClauseDb {
 /// after any backtrack neither watched literal is false unless the other
 /// is true and was assigned no later -- which is exactly what lets the
 /// clause be ignored until a watched literal becomes false again.
-pub fn propagate_clauses(assigned: Lit, node: &mut Node) -> Result<(), Conflict> {
+///
+/// `work` is told how many clauses were looked at and how many literals
+/// scanned for a replacement watch, for the diagnostics.
+pub fn propagate_clauses(assigned: Lit, node: &mut Node, work: &mut ClauseWork) -> Result<(), Conflict> {
     if !node.clauses().has_watches(assigned) {
         // The common case while few clauses are learned, and on the path
         // every assignment takes.
@@ -120,6 +189,7 @@ pub fn propagate_clauses(assigned: Lit, node: &mut Node) -> Result<(), Conflict>
     let mut i = 0;
     while i < list.len() {
         let idx = list[i];
+        work.visits += 1;
         // Keep the literal just falsified second, so the first is the one
         // that may still save the clause.
         let first = {
@@ -136,6 +206,7 @@ pub fn propagate_clauses(assigned: Lit, node: &mut Node) -> Result<(), Conflict>
         let replacement = node.clauses().clause(idx)[2..]
             .iter()
             .position(|&lit| node.lit_value(lit) != Some(false));
+        work.literals_scanned += replacement.map_or(node.clauses().clause(idx).len() - 2, |k| k + 1);
         if let Some(k) = replacement {
             let clause = node.clauses_mut().clause_mut(idx);
             clause.swap(1, k + 2);
@@ -165,6 +236,9 @@ impl Node {
     pub fn check_clauses(&self) {
         use crate::algorithms::lit::Value;
         for idx in 0..self.clauses().clause_count() {
+            if !self.clauses().is_live(idx) {
+                continue;
+            }
             let clause = self.clauses().clause(idx);
             let trues = clause.iter().filter(|&&l| self.lit_value(l) == Some(true)).count();
             let undecideds = clause.iter().filter(|&&l| self.lit_value(l).is_none()).count();
@@ -173,6 +247,7 @@ impl Node {
         }
         for a in 0..self.value_count() {
             if let (true, Reason::Clause(idx)) = (self.value(a) != Value::Undecided, self.reason(a)) {
+                assert!(self.clauses().is_live(idx), "{a}'s reason, clause {idx}, was deleted");
                 let clause = self.clauses().clause(idx);
                 let others_false = clause.iter()
                     .filter(|&&l| l.arg() != a)

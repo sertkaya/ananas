@@ -1,5 +1,5 @@
 use crate::af::AF;
-use crate::algorithms::clauses::propagate_clauses;
+use crate::algorithms::clauses::{propagate_clauses, ClauseWork};
 use crate::algorithms::lit::{Assignment, Lit, Reason, Semantics, Value};
 use crate::algorithms::node::Node;
 
@@ -156,6 +156,11 @@ fn unapply(lit: Lit, node: &mut Node, af: &AF) {
 /// contradictory, and must be backtracked to before whatever assignment
 /// was being propagated.
 pub fn propagate(node: &mut Node, af: &AF) -> Result<(), Conflict> {
+    propagate_counting(node, af, &mut ClauseWork::default())
+}
+
+/// `propagate`, adding what the learned clauses cost to `work`
+pub fn propagate_counting(node: &mut Node, af: &AF, work: &mut ClauseWork) -> Result<(), Conflict> {
     while let Some(lit) = node.next_to_propagate() {
         apply(lit, node, af);
         match lit {
@@ -172,7 +177,7 @@ pub fn propagate(node: &mut Node, af: &AF) -> Result<(), Conflict> {
                     set_out(b, Reason::Member(m), node)?;
                     node.assign_def(b, Lit::In(m));
                 }
-                propagate_clauses(lit, node)?;
+                propagate_clauses(lit, node, work)?;
             }
             Lit::Out(c) => {
                 if node.semantics() == Semantics::Stable {
@@ -183,7 +188,7 @@ pub fn propagate(node: &mut Node, af: &AF) -> Result<(), Conflict> {
                 for &v in af.victims(c) {
                     resolve_defenders(v, node, af)?;
                 }
-                propagate_clauses(lit, node)?;
+                propagate_clauses(lit, node, work)?;
             }
             Lit::Def(b) => {
                 // A victim of `b` with no attacker left that is not known

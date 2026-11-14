@@ -31,6 +31,11 @@ pub struct Learned {
     /// How many literals the clause had before minimization removed the
     /// ones implied by the others
     pub unminimized_len: usize,
+    /// The literal block distance: how many distinct decision levels the
+    /// literals were assigned at. Literals from one level were propagated
+    /// together from one decision and tend to recur together, so the fewer
+    /// levels a clause spans, the sooner it is likely to become unit again.
+    pub lbd: usize,
 }
 
 /// The literal that held when `b` became known defeated, standing in for
@@ -102,6 +107,10 @@ pub struct Analyzer {
     // depth-first walk
     buffer: Vec<Lit>,
     stack: Vec<usize>,
+    // Stamps per decision level for counting a clause's distinct levels,
+    // and the ones stamped, to clear them afterwards
+    level_seen: Vec<bool>,
+    levels_touched: Vec<usize>,
 }
 
 impl Analyzer {
@@ -112,6 +121,9 @@ impl Analyzer {
             touched: Vec::new(),
             buffer: Vec::new(),
             stack: Vec::new(),
+            // There can be no more decision levels than arguments
+            level_seen: vec![false; argument_count + 1],
+            levels_touched: Vec::new(),
         }
     }
 
@@ -181,6 +193,26 @@ impl Analyzer {
         true
     }
 
+    /// How many distinct decision levels the literals of `clause` are
+    /// assigned at. The touched-marks are free at this point, so they
+    /// serve as the level stamps.
+    fn distinct_levels(&mut self, clause: &[Lit], node: &Node) -> usize {
+        let mut count = 0;
+        for &lit in clause {
+            let level = node.level(lit.arg());
+            if !self.level_seen[level] {
+                self.level_seen[level] = true;
+                self.levels_touched.push(level);
+                count += 1;
+            }
+        }
+        for &level in &self.levels_touched {
+            self.level_seen[level] = false;
+        }
+        self.levels_touched.clear();
+        count
+    }
+
     /// Derive a learned clause from `conflict`, which propagation has just
     /// run into on `node` and which has not been backtracked yet.
     ///
@@ -203,11 +235,12 @@ impl Analyzer {
                 literals: Vec::new(),
                 assertion_level: 0,
                 unminimized_len: 0,
+                lbd: 0,
             });
         };
         let level = conflict_lits.iter().map(|&l| node.level(l.arg())).max().unwrap_or(0);
         if level == 0 {
-            return Some(Learned { literals: Vec::new(), assertion_level: 0, unminimized_len: 0 });
+            return Some(Learned { literals: Vec::new(), assertion_level: 0, unminimized_len: 0, lbd: 0 });
         }
 
         // Literals from below the conflict level go straight into the
@@ -266,11 +299,21 @@ impl Analyzer {
         }
         self.touched.clear();
 
-        let assertion_level = kept[1..].iter()
-            .map(|&l| node.level(l.arg()))
-            .max()
-            .unwrap_or(0);
-        Some(Learned { literals: kept, assertion_level, unminimized_len })
+        // The literal from the highest level after the first goes second,
+        // to be the clause's other watched literal: it is the last to be
+        // undone when the search backtracks, so as long as it is false the
+        // first literal is the only one that can be undecided. With any
+        // other literal watched instead, the clause could become unit
+        // again, below the assertion level, with no watch to notice.
+        if kept.len() > 2 {
+            let deepest = (1..kept.len())
+                .max_by_key(|&i| node.level(kept[i].arg()))
+                .expect("at least two literals");
+            kept.swap(1, deepest);
+        }
+        let assertion_level = kept.get(1).map_or(0, |&l| node.level(l.arg()));
+        let lbd = self.distinct_levels(&kept, node);
+        Some(Learned { literals: kept, assertion_level, unminimized_len, lbd })
     }
 }
 
@@ -393,7 +436,7 @@ mod tests {
             af.add_attack(a, b);
         }
         let mut node = Node::new(&af, Semantics::Complete);
-        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
+        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)], 3);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
         assert!(node.is_out(0) && node.value(2) == Value::Undecided);
@@ -424,7 +467,7 @@ mod tests {
             af.add_attack(a, b);
         }
         let mut node = Node::new(&af, Semantics::Complete);
-        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
+        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)], 3);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
         node.new_level();
@@ -447,7 +490,7 @@ mod tests {
             af.add_attack(a, b);
         }
         let mut node = Node::new(&af, Semantics::Complete);
-        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
+        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)], 3);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
         node.new_level();
@@ -486,7 +529,7 @@ mod tests {
                     }
                     let first = learned.literals[0];
                     let level = learned.assertion_level;
-                    let idx = node.clauses_mut().add_clause(learned.literals);
+                    let idx = node.clauses_mut().add_clause(learned.literals, learned.lbd);
                     if level > 0 && rng.below(8) == 0 {
                         // Restart: the clause stays, and may well become unit
                         // again under the next decisions -- which is what
@@ -682,6 +725,12 @@ mod tests {
             }
             if learned.literals.is_empty() {
                 continue;
+            }
+            // The second literal is the other watch, and must be the one
+            // undone last on backtracking: the one at the assertion level
+            if let Some(&second) = learned.literals.get(1) {
+                assert_eq!(node.level(second.arg()), learned.assertion_level,
+                    "round {round}: {:?} does not watch its assertion-level literal", learned.literals);
             }
             let level = node.level(learned.literals[0].arg());
             if !ruled_out_at.contains(&level) {
