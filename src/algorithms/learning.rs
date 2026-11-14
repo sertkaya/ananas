@@ -10,6 +10,7 @@
 //! literals, and can only ever force an argument in or out.
 
 use crate::af::AF;
+use crate::algorithms::activity::Activity;
 use crate::algorithms::closure::Conflict;
 use crate::algorithms::lit::{Lit, Reason, Value};
 use crate::algorithms::node::Node;
@@ -127,10 +128,11 @@ impl Analyzer {
         }
     }
 
-    /// Mark the argument of `lit` seen. Returns 1 if that puts `lit` among
-    /// the literals still to resolve at the conflict level, 0 if it was
-    /// already seen, holds at level 0, or went into the clause.
-    fn mark(&mut self, lit: Lit, level: usize, node: &Node, literals: &mut Vec<Lit>) -> usize {
+    /// Mark the argument of `lit` seen, bumping its activity. Returns 1 if
+    /// that puts `lit` among the literals still to resolve at the conflict
+    /// level, 0 if it was already seen, holds at level 0, or went into the
+    /// clause.
+    fn mark(&mut self, lit: Lit, level: usize, node: &Node, literals: &mut Vec<Lit>, activity: &mut Activity) -> usize {
         let a = lit.arg();
         let lit_level = node.level(a);
         if lit_level == 0 || self.seen[a] {
@@ -138,6 +140,7 @@ impl Analyzer {
         }
         self.seen[a] = true;
         self.touched.push(a);
+        activity.bump(a);
         if lit_level == level {
             1
         } else {
@@ -214,7 +217,8 @@ impl Analyzer {
     }
 
     /// Derive a learned clause from `conflict`, which propagation has just
-    /// run into on `node` and which has not been backtracked yet.
+    /// run into on `node` and which has not been backtracked yet, bumping
+    /// the activity of every argument resolved through.
     ///
     /// Resolves the conflict back along the trail, through the antecedents
     /// of each literal at the conflict's decision level, until a single
@@ -229,7 +233,7 @@ impl Analyzer {
     /// At level 0 the assumptions are the query and what follows from the
     /// framework alone, so a contradiction among them gives the empty
     /// clause.
-    pub fn analyze(&mut self, conflict: Conflict, node: &Node, af: &AF) -> Option<Learned> {
+    pub fn analyze(&mut self, conflict: Conflict, node: &Node, af: &AF, activity: &mut Activity) -> Option<Learned> {
         let Some(conflict_lits) = conflict_literals(conflict, node, af) else {
             return (node.decision_level() == 0).then(|| Learned {
                 literals: Vec::new(),
@@ -249,7 +253,7 @@ impl Analyzer {
         let mut literals: Vec<Lit> = Vec::new();
         let mut pending = 0;
         for lit in conflict_lits {
-            pending += self.mark(lit, level, node, &mut literals);
+            pending += self.mark(lit, level, node, &mut literals, activity);
         }
 
         let trail = node.trail();
@@ -272,7 +276,7 @@ impl Analyzer {
             buffer.clear();
             if antecedents(a, node.reason(a), node, af, &mut buffer) {
                 for &antecedent in &buffer {
-                    pending += self.mark(antecedent, level, node, &mut literals);
+                    pending += self.mark(antecedent, level, node, &mut literals, activity);
                 }
             } else {
                 // A further assumption at the conflict level: nothing to
@@ -333,7 +337,8 @@ mod tests {
     use crate::algorithms::random_af::{random_af, Rng};
 
     fn analyze(conflict: Conflict, node: &Node, af: &AF) -> Option<Learned> {
-        Analyzer::new(af.argument_count()).analyze(conflict, node, af)
+        let mut activity = Activity::new(af.argument_count());
+        Analyzer::new(af.argument_count()).analyze(conflict, node, af, &mut activity)
     }
 
     /// Whether the extension `set` satisfies the clause `literals`
@@ -513,6 +518,7 @@ mod tests {
         let n = af.argument_count();
         let (mut node, mut result) = root(af, query);
         let mut analyzer = Analyzer::new(n);
+        let mut activity = Activity::new(n);
         let mut learned_count = 0;
         let mut watch_forced = 0;
         let mut steps = 0;
@@ -521,7 +527,7 @@ mod tests {
             assert!(steps < 100_000, "the search does not terminate\n{af}");
             match result {
                 Err(conflict) => {
-                    let learned = analyzer.analyze(conflict, &node, af)
+                    let learned = analyzer.analyze(conflict, &node, af, &mut activity)
                         .expect("decisions are only made on undecided arguments");
                     learned_count += 1;
                     if learned.literals.is_empty() {

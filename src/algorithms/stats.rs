@@ -17,6 +17,7 @@ pub struct Stats {
     pub clauses: usize,
     pub reductions: usize,
     pub deleted: usize,
+    pub restarts: usize,
     // The learned clauses: how long they are, how many literals
     // minimization took off them, and how many decision levels each jumped
     // back over -- chronological backtracking would always be exactly one
@@ -75,12 +76,13 @@ impl Display for Stats {
         };
         write!(
             f,
-            "decisions={} propagations={} conflicts={} clauses={} reductions={} deleted={} \
+            "decisions={} propagations={} conflicts={} restarts={} clauses={} reductions={} deleted={} \
              learned_len_avg={:.1} learned_len_max={} \
              minimized_away_avg={:.1} backjump_avg={:.2} backjump_max={} nonchronological_backjumps={}",
             self.decisions,
             self.propagations,
             self.conflicts,
+            self.restarts,
             self.clauses,
             self.reductions,
             self.deleted,

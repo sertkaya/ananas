@@ -1,3 +1,4 @@
+mod activity;
 mod clauses;
 mod closure;
 pub mod complete;
