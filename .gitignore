@@ -1,0 +1,9 @@
+# Build output
+/target/
+
+# ICCMA benchmark data and result tables (several hundred MB)
+/iccma2025-benchmarks/
+
+# Tooling
+__pycache__/
+/.idea/
