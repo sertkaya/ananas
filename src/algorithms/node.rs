@@ -1,74 +1,8 @@
 use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use crate::af::AF;
-
-/// Whether an argument belongs to a node's set: decided either way, or not
-/// yet decided
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Value {
-    Undecided,
-    In,
-    Out,
-}
-
-/// Why an argument was assigned its value. Recorded with every assignment
-/// so that a conflict can be traced back to the assignments that caused it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reason {
-    /// In by assumption: the query argument, an unattacked argument, or a
-    /// search decision
-    Decision,
-    /// Out because it attacks itself
-    SelfAttack,
-    /// Out because a search candidate's whole subtree failed with it in.
-    /// Like a decision, it has no antecedents on the trail.
-    RuledOut,
-    /// Out because it attacks, or is attacked by, the given member
-    Member(usize),
-    /// In because every one of its attackers is known defeated
-    Completeness,
-    /// In because it is the only usable defender left against the given
-    /// argument, which must be defeated: every other attacker of it is out
-    OnlyDefender(usize),
-    /// Forced by the learned clause with the given index: every other
-    /// literal of it is false
-    Clause(usize),
-}
-
-/// A fact assigned during propagation, whose consequences are still to be
-/// propagated
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Lit {
-    /// The argument is in the set
-    In(usize),
-    /// The argument is out of the set
-    Out(usize),
-    /// The argument is defeated in every complete extension of the set
-    Def(usize),
-}
-
-impl Lit {
-    /// The opposite of an `In` or `Out` literal. `Def` has no opposite:
-    /// nothing ever records that an argument must stay undefeated.
-    pub fn negated(self) -> Lit {
-        match self {
-            Lit::In(a) => Lit::Out(a),
-            Lit::Out(a) => Lit::In(a),
-            Lit::Def(_) => panic!("Def literals have no negation"),
-        }
-    }
-}
-
-/// Outcome of assigning a value to an argument
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Assignment {
-    /// The argument was undecided and now has the value
-    New,
-    /// The argument already had the value
-    Unchanged,
-    /// The argument already had the opposite value
-    Conflict,
-}
+use crate::algorithms::clauses::ClauseDb;
+use crate::algorithms::lit::{Assignment, Lit, Reason, Value};
 
 /// The search's state: a partial assignment, the trail of assignments that
 /// built it, and the counters the closure rules derive from it.
@@ -125,15 +59,8 @@ pub struct Node {
     // The trail's length when each decision level above 0 began, so the
     // current decision level is the length of this
     level_start: Vec<usize>,
-    // Clauses learned from conflicts: disjunctions of In/Out literals that
-    // every complete extension containing the query satisfies. The first
-    // two literals of each are watched: as long as neither is false, the
-    // clause cannot be unit or falsified, so it need not be looked at.
-    clauses: Vec<Vec<Lit>>,
-    // For each argument, the clauses watching a literal that its becoming
-    // in, respectively out, makes false -- i.e. watching Out(a) and In(a)
-    watch_on_in: Vec<Vec<usize>>,
-    watch_on_out: Vec<Vec<usize>>,
+    // The clauses learned so far, with their watches
+    clauses: ClauseDb,
 }
 
 // Create a new node
@@ -176,9 +103,7 @@ impl Node {
             trail: Vec::new(),
             propagated: 0,
             level_start: Vec::new(),
-            clauses: Vec::new(),
-            watch_on_in: vec![Vec::new(); af.argument_count()],
-            watch_on_out: vec![Vec::new(); af.argument_count()],
+            clauses: ClauseDb::new(af.argument_count()),
         }
     }
 
@@ -200,77 +125,14 @@ impl Node {
         }
     }
 
-    /// Store a learned clause, watching its first two literals, and return
-    /// its index. A clause of fewer than two literals gets no watches: it is
-    /// either empty, or a unit the caller asserts at level 0 for good.
-    // Not called outside tests until the search learns
-    #[allow(dead_code)]
-    pub fn add_clause(&mut self, literals: Vec<Lit>) -> usize {
-        let idx = self.clauses.len();
-        if literals.len() >= 2 {
-            self.watch(literals[0], idx);
-            self.watch(literals[1], idx);
-        }
-        self.clauses.push(literals);
-        idx
+    /// The learned clauses and their watches
+    pub fn clauses(&self) -> &ClauseDb {
+        &self.clauses
     }
 
-    /// Have clause `idx` watch `lit`: it will be looked at when `lit`
-    /// becomes false
-    pub fn watch(&mut self, lit: Lit, idx: usize) {
-        match lit {
-            Lit::In(a) => self.watch_on_out[a].push(idx),
-            Lit::Out(a) => self.watch_on_in[a].push(idx),
-            Lit::Def(_) => unreachable!("clauses have no Def literals"),
-        }
-    }
-
-    /// Whether any clause is to be looked at now that `assigned` holds
-    pub fn has_watches(&self, assigned: Lit) -> bool {
-        match assigned {
-            Lit::In(a) => !self.watch_on_in[a].is_empty(),
-            Lit::Out(a) => !self.watch_on_out[a].is_empty(),
-            Lit::Def(_) => false,
-        }
-    }
-
-    /// Take the list of clauses to look at now that `assigned` holds,
-    /// leaving it empty; `put_watches` returns it
-    pub fn take_watches(&mut self, assigned: Lit) -> Vec<usize> {
-        match assigned {
-            Lit::In(a) => std::mem::take(&mut self.watch_on_in[a]),
-            Lit::Out(a) => std::mem::take(&mut self.watch_on_out[a]),
-            Lit::Def(_) => Vec::new(),
-        }
-    }
-
-    /// Return a watch list taken with `take_watches`, keeping any watches
-    /// added to it in the meantime
-    pub fn put_watches(&mut self, assigned: Lit, mut list: Vec<usize>) {
-        let slot = match assigned {
-            Lit::In(a) => &mut self.watch_on_in[a],
-            Lit::Out(a) => &mut self.watch_on_out[a],
-            Lit::Def(_) => return,
-        };
-        list.append(slot);
-        *slot = list;
-    }
-
-    /// Get the literals of clause `idx`
-    pub fn clause(&self, idx: usize) -> &[Lit] {
-        &self.clauses[idx]
-    }
-
-    /// Get the literals of clause `idx`, to reorder its watches
-    pub fn clause_mut(&mut self, idx: usize) -> &mut Vec<Lit> {
-        &mut self.clauses[idx]
-    }
-
-    /// Get the number of learned clauses stored
-    // Not called outside tests until the search learns
-    #[allow(dead_code)]
-    pub fn clause_count(&self) -> usize {
-        self.clauses.len()
+    /// The learned clauses and their watches, to add to or rewatch
+    pub fn clauses_mut(&mut self) -> &mut ClauseDb {
+        &mut self.clauses
     }
 
     /// Get the number of arguments

@@ -1,5 +1,7 @@
 use crate::af::AF;
-use crate::algorithms::node::{Assignment, Lit, Node, Reason, Value};
+use crate::algorithms::clauses::propagate_clauses;
+use crate::algorithms::lit::{Assignment, Lit, Reason, Value};
+use crate::algorithms::node::Node;
 
 /// A contradiction that propagation ran into
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,65 +132,6 @@ fn unapply(lit: Lit, node: &mut Node, af: &AF) {
             }
         }
     }
-}
-
-/// Look at every learned clause watching a literal that `assigned` has just
-/// made false. A clause whose other watched literal is true is left alone;
-/// one with another literal that is not false moves its watch there; one
-/// with neither is unit, and forces its remaining literal, or falsified.
-///
-/// Watches need no undoing on backtrack: a clause's two watched literals
-/// are only ever both false at a conflict, which backtracking undoes, so
-/// after any backtrack neither watched literal is false unless the other
-/// is true and was assigned no later -- which is exactly what lets the
-/// clause be ignored until a watched literal becomes false again.
-fn propagate_clauses(assigned: Lit, node: &mut Node) -> Result<(), Conflict> {
-    if !node.has_watches(assigned) {
-        // The common case while few clauses are learned, and on the path
-        // every assignment takes.
-        return Ok(());
-    }
-    let falsified = assigned.negated();
-    let mut list = node.take_watches(assigned);
-    let mut result = Ok(());
-    let mut i = 0;
-    while i < list.len() {
-        let idx = list[i];
-        // Keep the literal just falsified second, so the first is the one
-        // that may still save the clause.
-        let first = {
-            let clause = node.clause_mut(idx);
-            if clause[0] == falsified {
-                clause.swap(0, 1);
-            }
-            clause[0]
-        };
-        if node.lit_value(first) == Some(true) {
-            i += 1;
-            continue;
-        }
-        let replacement = node.clause(idx)[2..]
-            .iter()
-            .position(|&lit| node.lit_value(lit) != Some(false));
-        if let Some(k) = replacement {
-            let clause = node.clause_mut(idx);
-            clause.swap(1, k + 2);
-            let new_watch = clause[1];
-            node.watch(new_watch, idx);
-            list.swap_remove(i);
-            continue;
-        }
-        if node.lit_value(first) == Some(false) {
-            result = Err(Conflict::Clause(idx));
-            break;
-        }
-        // Unit: `first` is undecided and every other literal is false.
-        assign_literal(first, Reason::Clause(idx), node)
-            .expect("an undecided literal cannot clash");
-        i += 1;
-    }
-    node.put_watches(assigned, list);
-    result
 }
 
 /// Propagate the consequences of the assignments queued on `node`'s trail

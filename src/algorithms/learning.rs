@@ -11,7 +11,8 @@
 
 use crate::af::AF;
 use crate::algorithms::closure::Conflict;
-use crate::algorithms::node::{Lit, Node, Reason, Value};
+use crate::algorithms::lit::{Lit, Reason, Value};
+use crate::algorithms::node::Node;
 
 /// A clause learned from a conflict: a disjunction of in/out literals that
 /// every complete extension containing the query satisfies, and that is
@@ -63,7 +64,7 @@ fn antecedents(arg: usize, reason: Reason, node: &Node, af: &AF, out: &mut Vec<L
         }
         Reason::Clause(idx) => {
             out.extend(
-                node.clause(idx).iter().filter(|&&l| arg_of(l) != arg).map(|&l| l.negated()),
+                node.clauses().clause(idx).iter().filter(|&&l| arg_of(l) != arg).map(|&l| l.negated()),
             );
         }
     }
@@ -91,7 +92,7 @@ fn conflict_literals(conflict: Conflict, node: &Node, af: &AF) -> Option<Vec<Lit
             lits.extend(af.attackers(b).map(|&c| Lit::Out(c)));
         }
         Conflict::Clause(idx) => {
-            lits.extend(node.clause(idx).iter().map(|&l| l.negated()));
+            lits.extend(node.clauses().clause(idx).iter().map(|&l| l.negated()));
         }
     }
     Some(lits)
@@ -387,8 +388,8 @@ mod tests {
     /// none is unit without having been propagated, and every assignment a
     /// clause forced is the clause's only literal that is not false
     fn check_clauses(node: &Node) {
-        for idx in 0..node.clause_count() {
-            let clause = node.clause(idx);
+        for idx in 0..node.clauses().clause_count() {
+            let clause = node.clauses().clause(idx);
             let is_true = |l: &&Lit| node.lit_value(**l) == Some(true);
             let undecided = |l: &&Lit| node.lit_value(**l).is_none();
             let trues = clause.iter().filter(is_true).count();
@@ -398,10 +399,10 @@ mod tests {
         }
         for a in 0..node.value_count() {
             if let (true, Reason::Clause(idx)) = (node.value(a) != Value::Undecided, node.reason(a)) {
-                let others_false = node.clause(idx).iter()
+                let others_false = node.clauses().clause(idx).iter()
                     .filter(|&&l| arg_of(l) != a)
                     .all(|&l| node.lit_value(l) == Some(false));
-                let own_true = node.clause(idx).iter()
+                let own_true = node.clauses().clause(idx).iter()
                     .any(|&l| arg_of(l) == a && node.lit_value(l) == Some(true));
                 assert!(others_false && own_true, "{a} is forced by clause {idx} wrongly");
             }
@@ -417,7 +418,7 @@ mod tests {
             af.add_attack(a, b);
         }
         let mut node = Node::new(&af);
-        node.add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
+        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
         assert!(node.is_out(0) && node.value(2) == Value::Undecided);
@@ -448,7 +449,7 @@ mod tests {
             af.add_attack(a, b);
         }
         let mut node = Node::new(&af);
-        node.add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
+        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
         node.new_level();
@@ -471,7 +472,7 @@ mod tests {
             af.add_attack(a, b);
         }
         let mut node = Node::new(&af);
-        node.add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
+        node.clauses_mut().add_clause(vec![Lit::In(0), Lit::In(2), Lit::In(4)]);
         node.new_level();
         assert!(pseudo_complete(vec![1], &mut node, &af).is_ok());
         node.new_level();
@@ -510,7 +511,7 @@ mod tests {
                     }
                     let first = learned.literals[0];
                     let level = learned.assertion_level;
-                    let idx = node.add_clause(learned.literals);
+                    let idx = node.clauses_mut().add_clause(learned.literals);
                     if level > 0 && rng.below(8) == 0 {
                         // Restart: the clause stays, and may well become unit
                         // again under the next decisions -- which is what
