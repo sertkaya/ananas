@@ -30,6 +30,9 @@ pub enum Reason {
     /// In because it is the only usable defender left against the given
     /// argument, which must be defeated: every other attacker of it is out
     OnlyDefender(usize),
+    /// Forced by the learned clause with the given index: every other
+    /// literal of it is false
+    Clause(usize),
 }
 
 /// A fact assigned during propagation, whose consequences are still to be
@@ -122,6 +125,15 @@ pub struct Node {
     // The trail's length when each decision level above 0 began, so the
     // current decision level is the length of this
     level_start: Vec<usize>,
+    // Clauses learned from conflicts: disjunctions of In/Out literals that
+    // every complete extension containing the query satisfies. The first
+    // two literals of each are watched: as long as neither is false, the
+    // clause cannot be unit or falsified, so it need not be looked at.
+    clauses: Vec<Vec<Lit>>,
+    // For each argument, the clauses watching a literal that its becoming
+    // in, respectively out, makes false -- i.e. watching Out(a) and In(a)
+    watch_on_in: Vec<Vec<usize>>,
+    watch_on_out: Vec<Vec<usize>>,
 }
 
 // Create a new node
@@ -164,7 +176,107 @@ impl Node {
             trail: Vec::new(),
             propagated: 0,
             level_start: Vec::new(),
+            clauses: Vec::new(),
+            watch_on_in: vec![Vec::new(); af.argument_count()],
+            watch_on_out: vec![Vec::new(); af.argument_count()],
         }
+    }
+
+    /// Whether a literal is true or false under the assignment, or `None`
+    /// while it is not decided
+    pub fn lit_value(&self, lit: Lit) -> Option<bool> {
+        match lit {
+            Lit::In(a) => match self.value[a] {
+                Value::In => Some(true),
+                Value::Out => Some(false),
+                Value::Undecided => None,
+            },
+            Lit::Out(a) => match self.value[a] {
+                Value::Out => Some(true),
+                Value::In => Some(false),
+                Value::Undecided => None,
+            },
+            Lit::Def(a) => self.known_defeated[a].then_some(true),
+        }
+    }
+
+    /// Store a learned clause, watching its first two literals, and return
+    /// its index. A clause of fewer than two literals gets no watches: it is
+    /// either empty, or a unit the caller asserts at level 0 for good.
+    // Not called outside tests until the search learns
+    #[allow(dead_code)]
+    pub fn add_clause(&mut self, literals: Vec<Lit>) -> usize {
+        let idx = self.clauses.len();
+        if literals.len() >= 2 {
+            self.watch(literals[0], idx);
+            self.watch(literals[1], idx);
+        }
+        self.clauses.push(literals);
+        idx
+    }
+
+    /// Have clause `idx` watch `lit`: it will be looked at when `lit`
+    /// becomes false
+    pub fn watch(&mut self, lit: Lit, idx: usize) {
+        match lit {
+            Lit::In(a) => self.watch_on_out[a].push(idx),
+            Lit::Out(a) => self.watch_on_in[a].push(idx),
+            Lit::Def(_) => unreachable!("clauses have no Def literals"),
+        }
+    }
+
+    /// Whether any clause is to be looked at now that `assigned` holds
+    pub fn has_watches(&self, assigned: Lit) -> bool {
+        match assigned {
+            Lit::In(a) => !self.watch_on_in[a].is_empty(),
+            Lit::Out(a) => !self.watch_on_out[a].is_empty(),
+            Lit::Def(_) => false,
+        }
+    }
+
+    /// Take the list of clauses to look at now that `assigned` holds,
+    /// leaving it empty; `put_watches` returns it
+    pub fn take_watches(&mut self, assigned: Lit) -> Vec<usize> {
+        match assigned {
+            Lit::In(a) => std::mem::take(&mut self.watch_on_in[a]),
+            Lit::Out(a) => std::mem::take(&mut self.watch_on_out[a]),
+            Lit::Def(_) => Vec::new(),
+        }
+    }
+
+    /// Return a watch list taken with `take_watches`, keeping any watches
+    /// added to it in the meantime
+    pub fn put_watches(&mut self, assigned: Lit, mut list: Vec<usize>) {
+        let slot = match assigned {
+            Lit::In(a) => &mut self.watch_on_in[a],
+            Lit::Out(a) => &mut self.watch_on_out[a],
+            Lit::Def(_) => return,
+        };
+        list.append(slot);
+        *slot = list;
+    }
+
+    /// Get the literals of clause `idx`
+    pub fn clause(&self, idx: usize) -> &[Lit] {
+        &self.clauses[idx]
+    }
+
+    /// Get the literals of clause `idx`, to reorder its watches
+    pub fn clause_mut(&mut self, idx: usize) -> &mut Vec<Lit> {
+        &mut self.clauses[idx]
+    }
+
+    /// Get the number of learned clauses stored
+    // Not called outside tests until the search learns
+    #[allow(dead_code)]
+    pub fn clause_count(&self) -> usize {
+        self.clauses.len()
+    }
+
+    /// Get the number of arguments
+    #[cfg(test)]
+    pub fn value_count(&self) -> usize {
+        self.value.len()
     }
 
     /// Get the value of an argument

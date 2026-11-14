@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::fmt::{Display, Formatter};
 use crate::af::AF;
 use crate::algorithms::closure::{backtrack_to_level, pseudo_complete, rule_out, Conflict};
-use crate::algorithms::learning::analyze;
+use crate::algorithms::learning::Analyzer;
 use crate::algorithms::node::{Node, Value};
 
 /// A node of the search tree: its decision level, and the candidate
@@ -113,6 +113,7 @@ struct Stats {
     conflicts: usize,
     learned_literals_sum: usize,
     learned_literals_max: usize,
+    minimized_away_sum: usize,
     backjump_sum: usize,
     backjump_max: usize,
     nonchronological_backjumps: usize,
@@ -134,14 +135,15 @@ impl Stats {
 
     /// Analyse `conflict`, just run into on `node`, and record the clause
     /// learning would make of it
-    fn record_conflict(&mut self, conflict: Conflict, node: &Node, af: &AF) {
-        let Some(learned) = analyze(conflict, node, af) else {
+    fn record_conflict(&mut self, conflict: Conflict, node: &Node, af: &AF, analyzer: &mut Analyzer) {
+        let Some(learned) = analyzer.analyze(conflict, node, af) else {
             return;
         };
         let jump = node.decision_level() - learned.assertion_level;
         self.conflicts += 1;
         self.learned_literals_sum += learned.literals.len();
         self.learned_literals_max = self.learned_literals_max.max(learned.literals.len());
+        self.minimized_away_sum += learned.unminimized_len - learned.literals.len();
         self.backjump_sum += jump;
         self.backjump_max = self.backjump_max.max(jump);
         if jump > 1 {
@@ -171,11 +173,12 @@ impl Display for Stats {
         if self.conflicts > 0 {
             write!(
                 f,
-                " conflicts={} learned_len_avg={:.1} learned_len_max={} \
+                " conflicts={} learned_len_avg={:.1} learned_len_max={} minimized_away_avg={:.1} \
                  backjump_avg={:.2} backjump_max={} nonchronological_backjumps={}",
                 self.conflicts,
                 average(self.learned_literals_sum, self.conflicts),
                 self.learned_literals_max,
+                average(self.minimized_away_sum, self.conflicts),
                 average(self.backjump_sum, self.conflicts),
                 self.backjump_max,
                 self.nonchronological_backjumps,
@@ -203,6 +206,7 @@ pub fn dc_co(af: &AF, arg: usize, verbose: bool) -> Option<HashSet<usize>> {
 /// The search behind `dc_co`, gathering diagnostics into `stats`
 fn search(af: &AF, arg: usize, verbose: bool, stats: &mut Stats) -> Option<HashSet<usize>> {
     let mut node = Node::new(af);
+    let mut analyzer = Analyzer::new(af.argument_count());
 
     // We hypothesize that `arg` is in the extension, and arguments with no
     // attackers are defended by default, so both are seeds; pseudo_complete
@@ -220,7 +224,7 @@ fn search(af: &AF, arg: usize, verbose: bool, stats: &mut Stats) -> Option<HashS
         // The hypothesis that `arg` is in the extension is already
         // contradictory: closing it produced a conflict.
         if verbose {
-            stats.record_conflict(conflict, &node, af);
+            stats.record_conflict(conflict, &node, af, &mut analyzer);
         }
         return None;
     }
@@ -258,7 +262,7 @@ fn search(af: &AF, arg: usize, verbose: bool, stats: &mut Stats) -> Option<HashS
             && let Err(conflict) = rule_out(failed, &mut node, af)
         {
             if verbose {
-                stats.record_conflict(conflict, &node, af);
+                stats.record_conflict(conflict, &node, af, &mut analyzer);
             }
             if frame.level > 0 {
                 backtrack_to_level(frame.level - 1, &mut node, af);
@@ -288,7 +292,7 @@ fn search(af: &AF, arg: usize, verbose: bool, stats: &mut Stats) -> Option<HashS
         match pseudo_complete(vec![c], &mut node, af) {
             Err(conflict) => {
                 if verbose {
-                    stats.record_conflict(conflict, &node, af);
+                    stats.record_conflict(conflict, &node, af, &mut analyzer);
                 }
                 backtrack_to_level(level, &mut node, af);
             }
