@@ -337,7 +337,7 @@ mod tests {
     use crate::algorithms::random_af::{random_af, Rng};
 
     fn analyze(conflict: Conflict, node: &Node, af: &AF) -> Option<Learned> {
-        let mut activity = Activity::new(af.argument_count());
+        let mut activity = Activity::new((0..af.argument_count()).collect());
         Analyzer::new(af.argument_count()).analyze(conflict, node, af, &mut activity)
     }
 
@@ -518,7 +518,7 @@ mod tests {
         let n = af.argument_count();
         let (mut node, mut result) = root(af, query);
         let mut analyzer = Analyzer::new(n);
-        let mut activity = Activity::new(n);
+        let mut activity = Activity::new((0..n).collect());
         let mut learned_count = 0;
         let mut watch_forced = 0;
         let mut steps = 0;

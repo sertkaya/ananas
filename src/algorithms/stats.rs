@@ -43,6 +43,12 @@ pub struct Stats {
     // looking for a new literal to watch
     pub clause_visits: usize,
     pub clause_literals_scanned: usize,
+    // How much choosing decisions costs: arguments popped off the activity
+    // heap, the undecided ones among them, which go back in, and victims
+    // scanned for targets
+    pub heap_pops: usize,
+    pub heap_undecided: usize,
+    pub victims_scanned: usize,
 }
 
 impl Stats {
@@ -106,13 +112,17 @@ impl Display for Stats {
         write!(
             f,
             " propagating={:.1}s analysing={:.1}s deciding={:.1}s backtracking={:.1}s \
-             clause_visits={} clause_literals_scanned={}",
+             clause_visits={} clause_literals_scanned={} \
+             pops/decision={:.1} undecided/decision={:.1} victims/decision={:.1}",
             seconds(self.propagating),
             seconds(self.analysing),
             seconds(self.deciding),
             seconds(self.backtracking),
             self.clause_visits,
             self.clause_literals_scanned,
+            average(self.heap_pops, self.decisions),
+            average(self.heap_undecided, self.decisions),
+            average(self.victims_scanned, self.decisions),
         )
     }
 }

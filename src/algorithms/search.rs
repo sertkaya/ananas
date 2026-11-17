@@ -27,6 +27,10 @@ pub struct Solver<'a> {
     node: Node,
     analyzer: Analyzer,
     activity: Activity,
+    // Scratch space for `decide`: the undecided arguments it popped
+    popped: Vec<usize>,
+    // Under stable semantics, the arguments by most attackers, then id
+    by_most_attackers: Vec<usize>,
     stats: Stats,
     verbose: bool,
     // Whether the arguments nothing attacks have been put in yet. They
@@ -70,6 +74,35 @@ fn luby(i: usize) -> usize {
     1 << seq
 }
 
+/// The arguments by number of attackers, fewest first or, if `most_first`,
+/// most first, and by id among equals: a counting sort, as frameworks can
+/// have millions of arguments
+fn by_attacker_count(af: &AF, most_first: bool) -> Vec<usize> {
+    let n = af.argument_count();
+    let max = (0..n).map(|a| af.attacker_count(a)).max().unwrap_or(0);
+    // The start of each count's block, in the order the blocks go
+    let mut start = vec![0; max + 2];
+    for a in 0..n {
+        let count = af.attacker_count(a);
+        start[if most_first { max - count } else { count } + 1] += 1;
+    }
+    for i in 1..start.len() {
+        start[i] += start[i - 1];
+    }
+    let mut order = vec![0; n];
+    for a in 0..n {
+        let count = af.attacker_count(a);
+        let block = if most_first { max - count } else { count };
+        order[start[block]] = a;
+        start[block] += 1;
+    }
+    order
+}
+
+// How many arguments as active as the best defender `decide` pops before
+// it turns to scanning the targets' attackers instead
+const TIES_POPPED: usize = 16;
+
 // Learned clauses are reduced for the first time after this many
 // conflicts, and then after this many more plus REDUCTION_GROWTH per
 // reduction so far, so that the database is allowed to grow slowly.
@@ -87,7 +120,14 @@ impl<'a> Solver<'a> {
             af,
             node: Node::new(af, semantics),
             analyzer: Analyzer::new(af.argument_count()),
-            activity: Activity::new(af.argument_count()),
+            // Equally active arguments come out of the heap as `decide`
+            // prefers defenders: fewest attackers first
+            activity: Activity::new(by_attacker_count(af, false)),
+            popped: Vec::new(),
+            by_most_attackers: match semantics {
+                Semantics::Complete => Vec::new(),
+                Semantics::Stable => by_attacker_count(af, true),
+            },
             stats: Stats::default(),
             verbose,
             started: false,
@@ -158,7 +198,7 @@ impl<'a> Solver<'a> {
     pub fn solve(&mut self, assumptions: &[usize]) -> Option<HashSet<usize>> {
         let af = self.af;
         let started_at = Instant::now();
-        backtrack_to_level(0, &mut self.node, af);
+        self.backtrack(0);
 
         let mut seeds = assumptions.to_vec();
         if !self.started {
@@ -208,7 +248,7 @@ impl<'a> Solver<'a> {
                         self.next_restart = self.stats.conflicts + self.restart_unit * luby(self.restarts + 1);
                     }
                     let level = if restart { 0 } else { learned.assertion_level };
-                    backtrack_to_level(level, &mut self.node, af);
+                    self.backtrack(level);
                     self.stats.backtracking += started.elapsed();
                     let first = learned.literals[0];
                     let idx = self.node.clauses_mut().add_clause(learned.literals, learned.lbd);
@@ -223,6 +263,8 @@ impl<'a> Solver<'a> {
                 Ok(()) => {
                     #[cfg(test)]
                     self.node.check_clauses();
+                    #[cfg(test)]
+                    self.node.check_targets();
                     if self.stats.conflicts >= self.next_reduction {
                         self.reduce_clauses();
                         #[cfg(test)]
@@ -283,50 +325,151 @@ impl<'a> Solver<'a> {
     /// one most likely to fail, so that what it fails on is learned early.
     /// (Measured on the ICCMA'25 stable samples; fewest attackers first
     /// was worse.)
-    fn decide(&self) -> Option<usize> {
+    ///
+    /// The heap hands out arguments most active first, so the search pops
+    /// until it finds a defender, and goes on through the arguments just as
+    /// active, each looked at by a scan of its victims. The heap orders
+    /// equals as defenders are preferred, fewest attackers first, so a
+    /// defender of a target with only two usable defenders, the fewest
+    /// there can be, ends the search at once. When the equally active
+    /// arguments are many -- typically those never involved in a conflict
+    /// -- the targets' attackers are scanned instead. Arguments popped
+    /// while undecided go back in, the decided ones return to the heap
+    /// when backtracking undecides them.
+    fn decide(&mut self) -> Option<usize> {
+        if self.node.targets().is_empty() {
+            return match self.node.semantics() {
+                Semantics::Complete => None,
+                Semantics::Stable => self.most_active_undecided(),
+            };
+        }
         let node = &self.node;
         let af = self.af;
-        // (activity, usable defenders of its target, attackers, id), best
-        // being the highest activity and then the lowest of the rest
-        let mut best: Option<(f64, usize, usize, usize)> = None;
-        for b in 0..af.argument_count() {
-            if !node.known_defeated(b) || node.defeat_propagated(b) {
+        // (usable defenders of its target, attackers, id) of the best
+        // defender so far, the lowest being best, and its activity
+        let mut best: Option<(usize, usize, usize)> = None;
+        let mut best_activity = 0.0;
+        let mut ties = 0;
+        let mut ties_left = false;
+        let mut popped = std::mem::take(&mut self.popped);
+        let (mut pops, mut victims) = (0, 0);
+        while let Some(c) = self.activity.pop() {
+            pops += 1;
+            if node.value(c) != Value::Undecided {
                 continue;
             }
-            // Maintained by the closure, so a read rather than a scan.
-            // After propagation it is exact and at least two: with fewer
-            // the closure would have forced the defender or failed.
-            let count = node.usable_defenders_count(b);
-            for &c in af.attackers(b) {
-                if node.value(c) != Value::Undecided {
-                    continue;
+            popped.push(c);
+            if best.is_some() {
+                if self.activity.of(c) < best_activity {
+                    break;
                 }
-                let key = (self.activity.of(c), count, af.attacker_count(c), c);
-                let better = match best {
-                    None => true,
-                    Some((activity, best_count, attackers, best_c)) => {
-                        key.0 > activity
-                            || (key.0 == activity && (count, key.2, c) < (best_count, attackers, best_c))
-                    }
-                };
-                if better {
+                ties += 1;
+                if ties > TIES_POPPED {
+                    ties_left = true;
+                    break;
+                }
+            }
+            // The most constrained target `c` defends against. The count
+            // is maintained by the closure, so a read rather than a scan;
+            // after propagation it is exact and at least two: with fewer
+            // the closure would have forced the defender or failed.
+            victims += af.victims(c).len();
+            let count = af.victims(c)
+                .filter(|&&b| node.known_defeated(b) && !node.defeat_propagated(b))
+                .map(|&b| node.usable_defenders_count(b))
+                .min();
+            if let Some(count) = count {
+                let key = (count, af.attacker_count(c), c);
+                if best.is_none_or(|best| key < best) {
                     best = Some(key);
+                    best_activity = self.activity.of(c);
+                }
+                // No count is lower, and the equally active arguments
+                // still to come rank behind `c` on the rest of the key
+                if count == 2 {
+                    break;
                 }
             }
         }
-        if let Some((_, _, _, c)) = best {
-            return Some(c);
+        self.stats.heap_pops += pops;
+        self.stats.heap_undecided += popped.len();
+        self.stats.victims_scanned += victims;
+        for &c in &popped {
+            self.activity.insert(c);
         }
-        match node.semantics() {
-            Semantics::Complete => None,
-            Semantics::Stable => (0..af.argument_count())
-                .filter(|&a| node.value(a) == Value::Undecided)
-                .min_by(|&a, &b| {
-                    self.activity.of(b).total_cmp(&self.activity.of(a))
-                        .then(af.attacker_count(b).cmp(&af.attacker_count(a)))
-                        .then(a.cmp(&b))
-                }),
+        popped.clear();
+        self.popped = popped;
+        // Every target has at least two usable defenders, all undecided,
+        // and every undecided argument is in the heap
+        let mut best = best.expect("a target has an undecided attacker");
+        if ties_left {
+            for &b in node.targets() {
+                let count = node.usable_defenders_count(b);
+                if count > best.0 {
+                    continue;
+                }
+                self.stats.victims_scanned += af.attacker_count(b);
+                for &c in af.attackers(b) {
+                    if node.value(c) == Value::Undecided && self.activity.of(c) == best_activity {
+                        best = best.min((count, af.attacker_count(c), c));
+                    }
+                }
+            }
         }
+        Some(best.2)
+    }
+
+    /// Under stable semantics, once no target is left: the most active
+    /// undecided argument, among equals the one with the most attackers,
+    /// then the smallest id. The heap yields equals by fewest attackers,
+    /// so all of the most active ones are popped to find it -- unless
+    /// they are inactive, never involved in a conflict.
+    fn most_active_undecided(&mut self) -> Option<usize> {
+        if self.node.undecided_count() == 0 {
+            return None;
+        }
+        let node = &self.node;
+        let af = self.af;
+        let mut best: Option<usize> = None;
+        let mut popped = std::mem::take(&mut self.popped);
+        while let Some(c) = self.activity.pop() {
+            self.stats.heap_pops += 1;
+            if node.value(c) != Value::Undecided {
+                continue;
+            }
+            popped.push(c);
+            match best {
+                // Then every undecided argument is as inactive, and the
+                // order they are wanted in is known in advance
+                None if self.activity.of(c) == 0.0 => {
+                    best = self.by_most_attackers.iter().copied().find(|&a| node.value(a) == Value::Undecided);
+                    break;
+                }
+                None => best = Some(c),
+                Some(b) if self.activity.of(c) < self.activity.of(b) => break,
+                Some(b) if af.attacker_count(c) > af.attacker_count(b) => best = Some(c),
+                Some(_) => {}
+            }
+        }
+        self.stats.heap_undecided += popped.len();
+        for &c in &popped {
+            self.activity.insert(c);
+        }
+        popped.clear();
+        self.popped = popped;
+        best
+    }
+
+    /// Backtrack to `level`, putting the arguments that become undecided
+    /// back into the activity heap
+    fn backtrack(&mut self, level: usize) {
+        let keep = self.node.trail_len_at(level);
+        for &lit in &self.node.trail()[keep..] {
+            if let Lit::In(a) | Lit::Out(a) = lit {
+                self.activity.insert(a);
+            }
+        }
+        backtrack_to_level(level, &mut self.node, self.af);
     }
 }
 
@@ -334,6 +477,21 @@ impl<'a> Solver<'a> {
 mod tests {
     use super::*;
     use crate::algorithms::random_af::{random_af, Rng};
+
+    #[test]
+    fn test_by_attacker_count() {
+        let mut rng = Rng::new(5);
+        for _ in 0..50 {
+            let n = 1 + rng.below(20);
+            let af = random_af(&mut rng, n, 30);
+            let mut fewest: Vec<usize> = (0..af.argument_count()).collect();
+            fewest.sort_by_key(|&a| (af.attacker_count(a), a));
+            assert_eq!(by_attacker_count(&af, false), fewest);
+            let mut most: Vec<usize> = (0..af.argument_count()).collect();
+            most.sort_by_key(|&a| (std::cmp::Reverse(af.attacker_count(a)), a));
+            assert_eq!(by_attacker_count(&af, true), most);
+        }
+    }
 
     #[test]
     fn test_luby() {

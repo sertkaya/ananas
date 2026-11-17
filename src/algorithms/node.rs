@@ -50,6 +50,13 @@ pub struct Node {
     // left to defend against it: reaching 1 may force that defender, and
     // reaching 0 kills the branch.
     usable_defenders_count: Vec<usize>,
+    // The targets: the arguments known defeated but not yet attacked by
+    // the set, in no particular order, and each argument's index among
+    // them, if it is one
+    targets: Vec<usize>,
+    target_index: Vec<Option<usize>>,
+    // How many arguments are undecided
+    undecided: usize,
     // Every assignment, in the order it was made. The self-attackers are
     // out from the start and are not on it.
     trail: Vec<Lit>,
@@ -100,6 +107,9 @@ impl Node {
             known_defeated,
             def_source,
             usable_defenders_count,
+            targets: Vec::new(),
+            target_index: vec![None; af.argument_count()],
+            undecided: self_attacking.iter().filter(|&&s| !s).count(),
             trail: Vec::new(),
             propagated: 0,
             level_start: Vec::new(),
@@ -194,6 +204,11 @@ impl Node {
         len
     }
 
+    /// The length the trail has when backtracked to `level`
+    pub fn trail_len_at(&self, level: usize) -> usize {
+        self.level_start.get(level).copied().unwrap_or(self.trail.len())
+    }
+
     /// Get every assignment made so far, in order
     pub fn trail(&self) -> &[Lit] {
         &self.trail
@@ -210,6 +225,7 @@ impl Node {
             Assignment::Conflict
         } else {
             self.value[arg] = value;
+            self.undecided -= 1;
             self.reason[arg] = reason;
             self.level[arg] = self.level_start.len();
             self.trail.push(match value {
@@ -241,8 +257,16 @@ impl Node {
             self.propagated = self.trail.len();
         }
         match lit {
-            Lit::In(a) | Lit::Out(a) => self.value[a] = Value::Undecided,
-            Lit::Def(a) => self.known_defeated[a] = false,
+            Lit::In(a) | Lit::Out(a) => {
+                self.value[a] = Value::Undecided;
+                self.undecided += 1;
+            }
+            Lit::Def(a) => {
+                self.known_defeated[a] = false;
+                if self.in_attackers_count[a] == 0 {
+                    self.remove_target(a);
+                }
+            }
         }
         Some((lit, was_propagated))
     }
@@ -289,11 +313,42 @@ impl Node {
     /// Count one more of `arg`'s attackers as propagated in
     pub fn add_in_attacker(&mut self, arg: usize) {
         self.in_attackers_count[arg] += 1;
+        if self.in_attackers_count[arg] == 1 && self.known_defeated[arg] {
+            self.remove_target(arg);
+        }
     }
 
     /// Count one fewer of `arg`'s attackers as propagated in
     pub fn remove_in_attacker(&mut self, arg: usize) {
         self.in_attackers_count[arg] -= 1;
+        if self.in_attackers_count[arg] == 0 && self.known_defeated[arg] {
+            self.add_target(arg);
+        }
+    }
+
+    /// How many arguments are undecided
+    pub fn undecided_count(&self) -> usize {
+        self.undecided
+    }
+
+    /// The targets: the arguments known to be defeated in every completion
+    /// but not yet attacked by the set, in no particular order
+    pub fn targets(&self) -> &[usize] {
+        &self.targets
+    }
+
+    fn add_target(&mut self, arg: usize) {
+        self.target_index[arg] = Some(self.targets.len());
+        self.targets.push(arg);
+    }
+
+    fn remove_target(&mut self, arg: usize) {
+        let i = self.target_index[arg].take().expect("a target is in the list");
+        let last = self.targets.pop().expect("the list holds arg");
+        if last != arg {
+            self.targets[i] = last;
+            self.target_index[last] = Some(i);
+        }
     }
 
     /// Get the number of `arg`'s attackers not yet known to be defeated in
@@ -334,6 +389,9 @@ impl Node {
     pub fn assign_def(&mut self, arg: usize, source: Lit) {
         if !self.known_defeated[arg] {
             self.known_defeated[arg] = true;
+            if self.in_attackers_count[arg] == 0 {
+                self.add_target(arg);
+            }
             self.def_source[arg] = source;
             self.trail.push(Lit::Def(arg));
         }
@@ -358,6 +416,21 @@ impl Node {
 
 #[cfg(test)]
 impl Node {
+    /// Assert that the target list holds exactly the arguments known
+    /// defeated and not yet attacked
+    pub fn check_targets(&self) {
+        let mut listed = self.targets.clone();
+        listed.sort_unstable();
+        let expected: Vec<usize> = (0..self.value.len())
+            .filter(|&a| self.known_defeated[a] && self.in_attackers_count[a] == 0)
+            .collect();
+        assert_eq!(listed, expected, "target list out of date");
+        assert_eq!(self.undecided, self.value.iter().filter(|&&v| v == Value::Undecided).count());
+        for (i, &a) in self.targets.iter().enumerate() {
+            assert_eq!(self.target_index[a], Some(i));
+        }
+    }
+
     /// Assert that this node is in exactly the state `other` is in, apart
     /// from stale entries for undecided arguments, which mean nothing
     pub fn assert_same_state(&self, other: &Node) {
@@ -374,6 +447,12 @@ impl Node {
         assert_eq!(self.in_attackers_count, other.in_attackers_count);
         assert_eq!(self.undefeated_attackers_count, other.undefeated_attackers_count);
         assert_eq!(self.known_defeated, other.known_defeated);
+        let sorted = |targets: &[usize]| {
+            let mut targets = targets.to_vec();
+            targets.sort_unstable();
+            targets
+        };
+        assert_eq!(sorted(&self.targets), sorted(&other.targets), "targets differ");
         assert_eq!(self.usable_defenders_count, other.usable_defenders_count);
         assert_eq!(self.trail, other.trail);
         assert_eq!(self.propagated, other.propagated);
