@@ -278,7 +278,11 @@ impl<'a> Solver<'a> {
     ///
     /// Under stable semantics, once no target is left, an argument that is
     /// still undecided has to be either in or attacked, so it is decided in
-    /// -- and learned out if that fails.
+    /// -- and learned out if that fails. The choice is again the most
+    /// active one, and among equals the one with the most attackers: the
+    /// one most likely to fail, so that what it fails on is learned early.
+    /// (Measured on the ICCMA'25 stable samples; fewest attackers first
+    /// was worse.)
     fn decide(&self) -> Option<usize> {
         let node = &self.node;
         let af = self.af;
@@ -315,7 +319,13 @@ impl<'a> Solver<'a> {
         }
         match node.semantics() {
             Semantics::Complete => None,
-            Semantics::Stable => (0..af.argument_count()).find(|&a| node.value(a) == Value::Undecided),
+            Semantics::Stable => (0..af.argument_count())
+                .filter(|&a| node.value(a) == Value::Undecided)
+                .min_by(|&a, &b| {
+                    self.activity.of(b).total_cmp(&self.activity.of(a))
+                        .then(af.attacker_count(b).cmp(&af.attacker_count(a)))
+                        .then(a.cmp(&b))
+                }),
         }
     }
 }
