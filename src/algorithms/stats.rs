@@ -8,6 +8,8 @@ use crate::algorithms::learning::Learned;
 #[derive(Default)]
 pub struct Stats {
     pub decisions: usize,
+    // How many of the decisions put an argument out
+    pub out_decisions: usize,
     // Calls of the closure: one per decision, per learned clause asserted,
     // and per set of assumptions
     pub propagations: usize,
@@ -82,10 +84,11 @@ impl Display for Stats {
         };
         write!(
             f,
-            "decisions={} propagations={} conflicts={} restarts={} clauses={} reductions={} deleted={} \
+            "decisions={} out_decisions={} propagations={} conflicts={} restarts={} clauses={} reductions={} deleted={} \
              learned_len_avg={:.1} learned_len_max={} \
              minimized_away_avg={:.1} backjump_avg={:.2} backjump_max={} nonchronological_backjumps={}",
             self.decisions,
+            self.out_decisions,
             self.propagations,
             self.conflicts,
             self.restarts,

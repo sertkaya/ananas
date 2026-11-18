@@ -31,6 +31,10 @@ pub struct Solver<'a> {
     popped: Vec<usize>,
     // Under stable semantics, the arguments by most attackers, then id
     by_most_attackers: Vec<usize>,
+    // Each argument's saved phase: the value it last had before
+    // backtracking undecided it, Undecided if it never had one
+    phase: Vec<Value>,
+    save_phases: bool,
     stats: Stats,
     verbose: bool,
     // Whether the arguments nothing attacks have been put in yet. They
@@ -128,6 +132,8 @@ impl<'a> Solver<'a> {
                 Semantics::Complete => Vec::new(),
                 Semantics::Stable => by_attacker_count(af, true),
             },
+            phase: vec![Value::Undecided; af.argument_count()],
+            save_phases: true,
             stats: Stats::default(),
             verbose,
             started: false,
@@ -189,6 +195,13 @@ impl<'a> Solver<'a> {
     pub fn set_restart_unit(&mut self, unit: usize) {
         self.restart_unit = unit;
         self.next_restart = unit * luby(1);
+    }
+
+    /// Decide every argument in once no target is left, instead of by its
+    /// saved phase, as a reference for testing phase saving
+    #[cfg(test)]
+    pub fn set_phase_saving(&mut self, on: bool) {
+        self.save_phases = on;
     }
 
     /// Find an extension that contains `assumptions` -- and everything
@@ -276,12 +289,15 @@ impl<'a> Solver<'a> {
                     let started = Instant::now();
                     let decision = self.decide();
                     self.stats.deciding += started.elapsed();
-                    let Some(c) = decision else {
+                    let Some(lit) = decision else {
                         return Some(self.node.arguments());
                     };
                     self.stats.decisions += 1;
+                    if let Lit::Out(_) = lit {
+                        self.stats.out_decisions += 1;
+                    }
                     self.node.new_level();
-                    result = assign_literal(Lit::In(c), Reason::Decision, &mut self.node)
+                    result = assign_literal(lit, Reason::Decision, &mut self.node)
                         .and_then(|()| self.propagate());
                 }
             }
@@ -301,30 +317,48 @@ impl<'a> Solver<'a> {
         result
     }
 
-    /// The next argument to put in, or `None` if the assignment already is
-    /// an extension.
+    /// The next decision, or `None` if the assignment already is an
+    /// extension.
     ///
     /// The targets are the arguments that must be defeated but are not yet
     /// attacked by the set: under complete semantics the undefeated
     /// attackers of members, under stable semantics also every argument
-    /// that is out. The decision is a usable defender of some target: the
-    /// most active one, so that the search stays with the arguments its
-    /// recent conflicts were about and the clauses it learns tie few
-    /// decision levels together. Among equally active defenders -- all of
-    /// them, until the first conflict -- the structural choice decides:
-    /// the most constrained target, the one with the fewest usable
-    /// defenders, and its defender with the fewest attackers of its own,
-    /// hence the least likely to need defending in turn. Ties go to the
-    /// smaller id, so that the search does not depend on how the framework
-    /// is stored.
+    /// that is out. While there are targets, the decision puts a usable
+    /// defender of one of them in; see `choose_defender`.
     ///
     /// Under stable semantics, once no target is left, an argument that is
-    /// still undecided has to be either in or attacked, so it is decided in
-    /// -- and learned out if that fails. The choice is again the most
-    /// active one, and among equals the one with the most attackers: the
-    /// one most likely to fail, so that what it fails on is learned early.
-    /// (Measured on the ICCMA'25 stable samples; fewest attackers first
-    /// was worse.)
+    /// still undecided has to be either in or attacked. The choice is the
+    /// most active one, and among equals the one with the most attackers:
+    /// the one most likely to fail in, so that what it fails on is learned
+    /// early. (Measured on the ICCMA'25 stable samples; fewest attackers
+    /// first was worse.) It gets its saved phase, the value it had before
+    /// the search last backtracked over it, and is put in if it never had
+    /// one: a restart or backjump then rebuilds the part of the extension
+    /// that did not take part in the conflict, as SAT solvers' phase saving
+    /// does. (On SE-ST st_542, 562s without phases, 60s with. Saving the
+    /// phases of defenders too was much worse: most decisions turned out.)
+    fn decide(&mut self) -> Option<Lit> {
+        if self.node.targets().is_empty() {
+            return match self.node.semantics() {
+                Semantics::Complete => None,
+                Semantics::Stable => self.most_active_undecided().map(|a| match self.phase[a] {
+                    Value::Out if self.save_phases => Lit::Out(a),
+                    _ => Lit::In(a),
+                }),
+            };
+        }
+        Some(Lit::In(self.choose_defender()))
+    }
+
+    /// The defender to put in: the most active usable defender of some
+    /// target, so that the search stays with the arguments its recent
+    /// conflicts were about and the clauses it learns tie few decision
+    /// levels together. Among equally active defenders -- all of them,
+    /// until the first conflict -- the structural choice decides: the most
+    /// constrained target, the one with the fewest usable defenders, and
+    /// its defender with the fewest attackers of its own, hence the least
+    /// likely to need defending in turn. Ties go to the smaller id, so that
+    /// the search does not depend on how the framework is stored.
     ///
     /// The heap hands out arguments most active first, so the search pops
     /// until it finds a defender, and goes on through the arguments just as
@@ -336,13 +370,7 @@ impl<'a> Solver<'a> {
     /// -- the targets' attackers are scanned instead. Arguments popped
     /// while undecided go back in, the decided ones return to the heap
     /// when backtracking undecides them.
-    fn decide(&mut self) -> Option<usize> {
-        if self.node.targets().is_empty() {
-            return match self.node.semantics() {
-                Semantics::Complete => None,
-                Semantics::Stable => self.most_active_undecided(),
-            };
-        }
+    fn choose_defender(&mut self) -> usize {
         let node = &self.node;
         let af = self.af;
         // (usable defenders of its target, attackers, id) of the best
@@ -416,7 +444,7 @@ impl<'a> Solver<'a> {
                 }
             }
         }
-        Some(best.2)
+        best.2
     }
 
     /// Under stable semantics, once no target is left: the most active
@@ -465,8 +493,16 @@ impl<'a> Solver<'a> {
     fn backtrack(&mut self, level: usize) {
         let keep = self.node.trail_len_at(level);
         for &lit in &self.node.trail()[keep..] {
-            if let Lit::In(a) | Lit::Out(a) = lit {
-                self.activity.insert(a);
+            match lit {
+                Lit::In(a) => {
+                    self.activity.insert(a);
+                    self.phase[a] = Value::In;
+                }
+                Lit::Out(a) => {
+                    self.activity.insert(a);
+                    self.phase[a] = Value::Out;
+                }
+                Lit::Def(_) => {}
             }
         }
         backtrack_to_level(level, &mut self.node, self.af);
@@ -542,6 +578,57 @@ mod tests {
         }
         // Often none at all: fine, the configuration is what is under test
         let _ = restarts;
+    }
+
+    // Under stable semantics, an argument decided once no target is left
+    // gets its saved phase, so after a backjump or restart it may be
+    // decided out. That happens mostly to an argument that was out by
+    // propagation, the other half of a mutual attack, so the frameworks
+    // here pair up all arguments in mutual attacks and add sparse random
+    // ones. The answers agree with the same search deciding every such
+    // argument in. One solver answers a
+    // growing list of assumptions, so phases and clauses carry over
+    // between calls.
+    #[test]
+    fn test_saved_phases_keep_answers() {
+        let mut rng = Rng::new(11);
+        let mut out_decisions = 0;
+        let mut answers = [0, 0];
+        for round in 0..200 {
+            let n = 40 + rng.below(121);
+            let percent = [1, 2, 3][rng.below(3)];
+            let mut af = random_af(&mut rng, n, percent);
+            for a in (0..n - 1).step_by(2) {
+                af.add_attack(a, a + 1);
+                af.add_attack(a + 1, a);
+            }
+            let mut saving = Solver::new(&af, Semantics::Stable, false);
+            saving.set_restart_unit(1);
+            let mut plain = Solver::new(&af, Semantics::Stable, false);
+            plain.set_phase_saving(false);
+            let mut assumed = Vec::new();
+            for _ in 0..5 {
+                assumed.push(rng.below(n));
+                let answer = saving.solve(&assumed);
+                let expected = plain.solve(&assumed);
+                assert_eq!(answer.is_some(), expected.is_some(),
+                    "round {round}, {assumed:?}: {answer:?} vs {expected:?}\n{af}");
+                match answer {
+                    Some(extension) => {
+                        assert!(assumed.iter().all(|a| extension.contains(a)) && af.is_stable(&extension),
+                            "round {round}, {assumed:?}: {extension:?}\n{af}");
+                        answers[0] += 1;
+                    }
+                    None => {
+                        answers[1] += 1;
+                        break;
+                    }
+                }
+            }
+            out_decisions += saving.stats().out_decisions;
+        }
+        assert!(out_decisions > 500, "too few decisions put an argument out ({out_decisions})");
+        assert!(answers[0] > 100 && answers[1] > 50, "answers too one-sided: {answers:?}");
     }
 
     // Deleting learned clauses and restarting change what the search does,
