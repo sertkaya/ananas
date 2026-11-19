@@ -18,6 +18,7 @@ use crate::algorithms::learning::Analyzer;
 use crate::algorithms::closure::Conflict;
 use crate::algorithms::lit::{Lit, Reason, Semantics, Value};
 use crate::algorithms::node::Node;
+use crate::algorithms::scc::topological_components;
 use crate::algorithms::stats::Stats;
 
 /// A conflict-driven search for extensions of one framework under one
@@ -29,8 +30,12 @@ pub struct Solver<'a> {
     activity: Activity,
     // Scratch space for `decide`: the undecided arguments it popped
     popped: Vec<usize>,
-    // Under stable semantics, the arguments by most attackers, then id
-    by_most_attackers: Vec<usize>,
+    // Under stable semantics, each argument's strongly connected
+    // component, numbered in topological order, and the arguments ordered
+    // as the activity heap orders inactive ones once no target is left:
+    // by group, then most attackers, then id
+    components: Vec<usize>,
+    stable_order: Vec<usize>,
     // Each argument's saved phase: the value it last had before
     // backtracking undecided it, Undecided if it never had one
     phase: Vec<Value>,
@@ -103,6 +108,25 @@ fn by_attacker_count(af: &AF, most_first: bool) -> Vec<usize> {
     order
 }
 
+/// The arguments of `order` ordered by `group`, in their order in `order`
+/// within a group: a counting sort
+fn by_group(order: &[usize], group: &[usize]) -> Vec<usize> {
+    let count = group.iter().max().map_or(0, |&g| g + 1);
+    let mut start = vec![0; count + 1];
+    for &a in order {
+        start[group[a] + 1] += 1;
+    }
+    for i in 1..start.len() {
+        start[i] += start[i - 1];
+    }
+    let mut sorted = vec![0; order.len()];
+    for &a in order {
+        sorted[start[group[a]]] = a;
+        start[group[a]] += 1;
+    }
+    sorted
+}
+
 // How many arguments as active as the best defender `decide` pops before
 // it turns to scanning the targets' attackers instead
 const TIES_POPPED: usize = 16;
@@ -120,18 +144,26 @@ impl<'a> Solver<'a> {
     /// A solver for `af` under `semantics`. If `verbose`, it prints its
     /// progress to stderr every thousand conflicts.
     pub fn new(af: &'a AF, semantics: Semantics, verbose: bool) -> Solver<'a> {
+        // Equally active arguments come out of the heap as `decide`
+        // prefers defenders: fewest attackers first
+        let mut activity = Activity::new(by_attacker_count(af, false));
+        let (components, stable_order) = match semantics {
+            Semantics::Complete => (Vec::new(), Vec::new()),
+            Semantics::Stable => {
+                let components = topological_components(af);
+                activity.set_groups(components.clone());
+                let order = by_group(&by_attacker_count(af, true), &components);
+                (components, order)
+            }
+        };
         Solver {
             af,
             node: Node::new(af, semantics),
             analyzer: Analyzer::new(af.argument_count()),
-            // Equally active arguments come out of the heap as `decide`
-            // prefers defenders: fewest attackers first
-            activity: Activity::new(by_attacker_count(af, false)),
+            activity,
             popped: Vec::new(),
-            by_most_attackers: match semantics {
-                Semantics::Complete => Vec::new(),
-                Semantics::Stable => by_attacker_count(af, true),
-            },
+            components,
+            stable_order,
             phase: vec![Value::Undecided; af.argument_count()],
             save_phases: true,
             stats: Stats::default(),
@@ -217,6 +249,9 @@ impl<'a> Solver<'a> {
         if !self.started {
             self.started = true;
             seeds.extend((0..af.argument_count()).filter(|&a| af.attacker_count(a) == 0));
+            if self.node.semantics() == Semantics::Stable && !assumptions.is_empty() {
+                self.cone_first(assumptions);
+            }
         }
         self.stats.propagations += 1;
         let mut result = pseudo_complete(seeds, &mut self.node, af);
@@ -317,6 +352,36 @@ impl<'a> Solver<'a> {
         result
     }
 
+    /// Under stable semantics, regroup the arguments so that the cone of
+    /// `assumptions` -- they and every argument with an attack path to
+    /// them -- comes first, in topological order, and then the rest, in
+    /// topological order
+    fn cone_first(&mut self, assumptions: &[usize]) {
+        let af = self.af;
+        let mut in_cone = vec![false; af.argument_count()];
+        let mut stack = Vec::new();
+        for &a in assumptions {
+            if !in_cone[a] {
+                in_cone[a] = true;
+                stack.push(a);
+            }
+        }
+        while let Some(v) = stack.pop() {
+            for &u in af.attackers(v) {
+                if !in_cone[u] {
+                    in_cone[u] = true;
+                    stack.push(u);
+                }
+            }
+        }
+        let count = self.components.iter().max().map_or(0, |&c| c + 1);
+        let groups: Vec<usize> = (0..af.argument_count())
+            .map(|a| self.components[a] + if in_cone[a] { 0 } else { count })
+            .collect();
+        self.stable_order = by_group(&by_attacker_count(af, true), &groups);
+        self.activity.set_groups(groups);
+    }
+
     /// The next decision, or `None` if the assignment already is an
     /// extension.
     ///
@@ -325,6 +390,23 @@ impl<'a> Solver<'a> {
     /// attackers of members, under stable semantics also every argument
     /// that is out. While there are targets, the decision puts a usable
     /// defender of one of them in; see `choose_defender`.
+    ///
+    /// Under stable semantics, the decisions go through the strongly
+    /// connected components in topological order, sources first, activity
+    /// choosing only within a component. An extension restricted to a
+    /// source component is a stable extension of it, and fixes what the
+    /// components below have to work with, so the search settles each
+    /// component before its descendants, and a conflict below jumps back
+    /// into an ancestor only when the ancestor's choice is at fault. With
+    /// a query, its cone -- the components with an attack path to it --
+    /// comes first: changing an ancestor of the query then does not undo
+    /// work on unrelated parts of the framework. (crusti_350_0.5_255_*:
+    /// all eight DC-ST and SE-ST queries, timeouts at 1200s before, now in
+    /// 54-143s. But crusti_200_0.1_127_15, DC-ST and SE-ST, both NO, went
+    /// from 211s and 292s to timeouts at 600s: refuting a local
+    /// contradiction wants activity to home in on it. Complete semantics,
+    /// where activity already follows the query, keeps the activity order:
+    /// the topological one made DC-CO several times slower.)
     ///
     /// Under stable semantics, once no target is left, an argument that is
     /// still undecided has to be either in or attacked. The choice is the
@@ -377,6 +459,7 @@ impl<'a> Solver<'a> {
         // defender so far, the lowest being best, and its activity
         let mut best: Option<(usize, usize, usize)> = None;
         let mut best_activity = 0.0;
+        let mut best_group = 0;
         let mut ties = 0;
         let mut ties_left = false;
         let mut popped = std::mem::take(&mut self.popped);
@@ -388,7 +471,7 @@ impl<'a> Solver<'a> {
             }
             popped.push(c);
             if best.is_some() {
-                if self.activity.of(c) < best_activity {
+                if self.activity.group(c) > best_group || self.activity.of(c) < best_activity {
                     break;
                 }
                 ties += 1;
@@ -411,6 +494,7 @@ impl<'a> Solver<'a> {
                 if best.is_none_or(|best| key < best) {
                     best = Some(key);
                     best_activity = self.activity.of(c);
+                    best_group = self.activity.group(c);
                 }
                 // No count is lower, and the equally active arguments
                 // still to come rank behind `c` on the rest of the key
@@ -438,7 +522,10 @@ impl<'a> Solver<'a> {
                 }
                 self.stats.victims_scanned += af.attacker_count(b);
                 for &c in af.attackers(b) {
-                    if node.value(c) == Value::Undecided && self.activity.of(c) == best_activity {
+                    if node.value(c) == Value::Undecided
+                        && self.activity.group(c) == best_group
+                        && self.activity.of(c) == best_activity
+                    {
                         best = best.min((count, af.attacker_count(c), c));
                     }
                 }
@@ -447,11 +534,12 @@ impl<'a> Solver<'a> {
         best.2
     }
 
-    /// Under stable semantics, once no target is left: the most active
-    /// undecided argument, among equals the one with the most attackers,
-    /// then the smallest id. The heap yields equals by fewest attackers,
-    /// so all of the most active ones are popped to find it -- unless
-    /// they are inactive, never involved in a conflict.
+    /// Under stable semantics, once no target is left: of the undecided
+    /// arguments in the first group, the most active, among equals the one
+    /// with the most attackers, then the smallest id. The heap yields
+    /// equals by fewest attackers, so all of the most active ones are
+    /// popped to find it -- unless they are inactive, never involved in a
+    /// conflict.
     fn most_active_undecided(&mut self) -> Option<usize> {
         if self.node.undecided_count() == 0 {
             return None;
@@ -467,14 +555,16 @@ impl<'a> Solver<'a> {
             }
             popped.push(c);
             match best {
-                // Then every undecided argument is as inactive, and the
-                // order they are wanted in is known in advance
+                // Then every undecided argument of its group is as
+                // inactive, and the order they are wanted in is known in
+                // advance
                 None if self.activity.of(c) == 0.0 => {
-                    best = self.by_most_attackers.iter().copied().find(|&a| node.value(a) == Value::Undecided);
+                    best = self.stable_order.iter().copied().find(|&a| node.value(a) == Value::Undecided);
                     break;
                 }
                 None => best = Some(c),
-                Some(b) if self.activity.of(c) < self.activity.of(b) => break,
+                Some(b) if self.activity.group(c) > self.activity.group(b)
+                    || self.activity.of(c) < self.activity.of(b) => break,
                 Some(b) if af.attacker_count(c) > af.attacker_count(b) => best = Some(c),
                 Some(_) => {}
             }
@@ -526,6 +616,22 @@ mod tests {
             let mut most: Vec<usize> = (0..af.argument_count()).collect();
             most.sort_by_key(|&a| (std::cmp::Reverse(af.attacker_count(a)), a));
             assert_eq!(by_attacker_count(&af, true), most);
+        }
+    }
+
+    #[test]
+    fn test_by_group() {
+        let mut rng = Rng::new(6);
+        for _ in 0..50 {
+            let n = 1 + rng.below(30);
+            let mut order: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() {
+                order.swap(i, rng.below(i + 1));
+            }
+            let group: Vec<usize> = (0..n).map(|_| rng.below(5)).collect();
+            let mut expected = order.clone();
+            expected.sort_by_key(|&a| group[a]);
+            assert_eq!(by_group(&order, &group), expected);
         }
     }
 

@@ -6,7 +6,9 @@
 //! relative to newer.
 //!
 //! The arguments are also kept in a heap, most active first, so that the
-//! search finds its next decision without scanning every argument. The
+//! search finds its next decision without scanning every argument. They
+//! can be put in groups, a smaller group coming first regardless of
+//! activity, for a decision order that activity only refines. The
 //! heap holds at least every undecided argument; the search drops decided
 //! ones as it pops them and puts arguments back as backtracking undecides
 //! them.
@@ -18,6 +20,8 @@ pub struct Activity {
     increment: f64,
     // Among equally active arguments, the one with the smaller rank first
     rank: Vec<usize>,
+    // Ahead of activity, the argument in the smaller group first
+    group: Vec<usize>,
     // A binary max-heap of arguments, and each argument's index in it
     heap: Vec<usize>,
     position: Vec<Option<usize>>,
@@ -41,7 +45,20 @@ impl Activity {
             position[a] = Some(i);
         }
         // Sorted by rank, and all equally (in)active, it already is a heap
-        Activity { score: vec![0.0; order.len()], increment: 1.0, rank, heap: order, position }
+        let group = vec![0; order.len()];
+        Activity { score: vec![0.0; order.len()], increment: 1.0, rank, group, heap: order, position }
+    }
+
+    /// Put every argument `a` in group `group[a]`: the heap hands out the
+    /// smaller groups first, by activity within a group
+    pub fn set_groups(&mut self, group: Vec<usize>) {
+        self.group = group;
+        self.rebuild();
+    }
+
+    /// The group of `arg`, 0 unless set
+    pub fn group(&self, arg: usize) -> usize {
+        self.group[arg]
     }
 
     /// The activity of `arg`
@@ -95,6 +112,9 @@ impl Activity {
 
     /// Whether `a` comes out of the heap before `b`
     fn before(&self, a: usize, b: usize) -> bool {
+        if self.group[a] != self.group[b] {
+            return self.group[a] < self.group[b];
+        }
         let (x, y) = (self.score[a], self.score[b]);
         x > y || (x == y && self.rank[a] < self.rank[b])
     }
@@ -153,9 +173,9 @@ mod tests {
     use crate::algorithms::random_af::Rng;
 
     // Whatever the bumps, insertions and pops, the heap hands out its
-    // arguments most active first, equals by rank.
+    // arguments by group, most active first within one, equals by rank.
     #[test]
-    fn test_heap_pops_by_activity_then_rank() {
+    fn test_heap_pops_by_group_activity_then_rank() {
         let mut rng = Rng::new(3);
         for _ in 0..200 {
             let n = 1 + rng.below(30);
@@ -168,6 +188,12 @@ mod tests {
                 rank[a] = i;
             }
             let mut activity = Activity::new(order);
+            // Half the time in a few groups, set before or during the run
+            let groups = rng.below(2) == 1;
+            let group: Vec<usize> = (0..n).map(|_| if groups { rng.below(4) } else { 0 }).collect();
+            if groups {
+                activity.set_groups(group.clone());
+            }
             let mut out = Vec::new();
             for _ in 0..100 {
                 match rng.below(4) {
@@ -190,7 +216,11 @@ mod tests {
                 popped.push(a);
             }
             let mut expected = popped.clone();
-            expected.sort_by(|&a, &b| activity.of(b).total_cmp(&activity.of(a)).then(rank[a].cmp(&rank[b])));
+            expected.sort_by(|&a, &b| {
+                group[a].cmp(&group[b])
+                    .then(activity.of(b).total_cmp(&activity.of(a)))
+                    .then(rank[a].cmp(&rank[b]))
+            });
             assert_eq!(popped, expected);
         }
     }
