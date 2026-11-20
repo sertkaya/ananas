@@ -127,7 +127,7 @@ fn by_group(order: &[usize], group: &[usize]) -> Vec<usize> {
     sorted
 }
 
-// How many arguments as active as the best defender `decide` pops before
+// How many arguments as active as the best candidate `decide` pops before
 // it turns to scanning the targets' attackers instead
 const TIES_POPPED: usize = 16;
 
@@ -145,7 +145,7 @@ impl<'a> Solver<'a> {
     /// progress to stderr every thousand conflicts.
     pub fn new(af: &'a AF, semantics: Semantics, verbose: bool) -> Solver<'a> {
         // Equally active arguments come out of the heap as `decide`
-        // prefers defenders: fewest attackers first
+        // prefers attackers of a target: fewest attackers first
         let mut activity = Activity::new(by_attacker_count(af, false));
         let (components, stable_order) = match semantics {
             Semantics::Complete => (Vec::new(), Vec::new()),
@@ -389,7 +389,8 @@ impl<'a> Solver<'a> {
     /// attacked by the set: under complete semantics the undefeated
     /// attackers of members, under stable semantics also every argument
     /// that is out. While there are targets, the decision puts a usable
-    /// defender of one of them in; see `choose_defender`.
+    /// attacker of one of them in, a defender of the set against that
+    /// target; see `choose_defender`.
     ///
     /// Under stable semantics, the decisions go through the strongly
     /// connected components in topological order, sources first, activity
@@ -418,7 +419,8 @@ impl<'a> Solver<'a> {
     /// one: a restart or backjump then rebuilds the part of the extension
     /// that did not take part in the conflict, as SAT solvers' phase saving
     /// does. (On SE-ST st_542, 562s without phases, 60s with. Saving the
-    /// phases of defenders too was much worse: most decisions turned out.)
+    /// phases for the decisions on attackers of targets too was much worse:
+    /// most decisions turned out.)
     fn decide(&mut self) -> Option<Lit> {
         if self.node.targets().is_empty() {
             return match self.node.semantics() {
@@ -432,22 +434,23 @@ impl<'a> Solver<'a> {
         Some(Lit::In(self.choose_defender()))
     }
 
-    /// The defender to put in: the most active usable defender of some
-    /// target, so that the search stays with the arguments its recent
-    /// conflicts were about and the clauses it learns tie few decision
-    /// levels together. Among equally active defenders -- all of them,
-    /// until the first conflict -- the structural choice decides: the most
-    /// constrained target, the one with the fewest usable defenders, and
-    /// its defender with the fewest attackers of its own, hence the least
-    /// likely to need defending in turn. Ties go to the smaller id, so that
-    /// the search does not depend on how the framework is stored.
+    /// The argument to put in: a usable attacker of some target, which
+    /// defends the set against it. The most active one, so that the search
+    /// stays with the arguments its recent conflicts were about and the
+    /// clauses it learns tie few decision levels together. Among equally
+    /// active candidates -- all of them, until the first conflict -- the
+    /// structural choice decides: the most constrained target, the one with
+    /// the fewest usable attackers, and of those the one with the fewest
+    /// attackers of its own, hence the least likely to need defending in
+    /// turn. Ties go to the smaller id, so that the search does not depend
+    /// on how the framework is stored.
     ///
     /// The heap hands out arguments most active first, so the search pops
-    /// until it finds a defender, and goes on through the arguments just as
-    /// active, each looked at by a scan of its victims. The heap orders
-    /// equals as defenders are preferred, fewest attackers first, so a
-    /// defender of a target with only two usable defenders, the fewest
-    /// there can be, ends the search at once. When the equally active
+    /// until it finds one that attacks a target, and goes on through the
+    /// arguments just as active, each looked at by a scan of its victims.
+    /// The heap orders equals as this choice prefers them, fewest attackers
+    /// first, so an attacker of a target with only two usable attackers,
+    /// the fewest there can be, ends the search at once. When the equally active
     /// arguments are many -- typically those never involved in a conflict
     /// -- the targets' attackers are scanned instead. Arguments popped
     /// while undecided go back in, the decided ones return to the heap
@@ -455,8 +458,9 @@ impl<'a> Solver<'a> {
     fn choose_defender(&mut self) -> usize {
         let node = &self.node;
         let af = self.af;
-        // (usable defenders of its target, attackers, id) of the best
-        // defender so far, the lowest being best, and its activity
+        // (usable attackers of its most constrained target, attackers, id)
+        // of the best candidate so far, the lowest being best, and its
+        // activity
         let mut best: Option<(usize, usize, usize)> = None;
         let mut best_activity = 0.0;
         let mut best_group = 0;
@@ -483,7 +487,7 @@ impl<'a> Solver<'a> {
             // The most constrained target `c` defends against. The count
             // is maintained by the closure, so a read rather than a scan;
             // after propagation it is exact and at least two: with fewer
-            // the closure would have forced the defender or failed.
+            // the closure would have forced the last one in or failed.
             victims += af.victims(c).len();
             let count = af.victims(c)
                 .filter(|&&b| node.known_defeated(b) && !node.defeat_propagated(b))
@@ -511,7 +515,7 @@ impl<'a> Solver<'a> {
         }
         popped.clear();
         self.popped = popped;
-        // Every target has at least two usable defenders, all undecided,
+        // Every target has at least two usable attackers, all undecided,
         // and every undecided argument is in the heap
         let mut best = best.expect("a target has an undecided attacker");
         if ties_left {

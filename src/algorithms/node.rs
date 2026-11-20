@@ -45,10 +45,10 @@ pub struct Node {
     // own being out. Meaningless otherwise.
     def_source: Vec<Lit>,
     // Number of each argument's attackers whose being out has not yet been
-    // propagated. Never less than the number of attackers that could still
-    // be added, so for an undefeated attacker of the set it bounds the ways
-    // left to defend against it: reaching 1 may force that defender, and
-    // reaching 0 kills the branch.
+    // propagated. For an argument the set must defeat these are its usable
+    // attackers, the set's remaining defenders against it. Never less than
+    // the number of attackers that could still be added, so reaching 1 may
+    // force the last of them in, and reaching 0 kills the branch.
     usable_defenders_count: Vec<usize>,
     // The targets: the arguments known defeated but not yet attacked by
     // the set, in no particular order, and each argument's index among
@@ -288,12 +288,13 @@ impl Node {
         self.usable_defenders_count[arg]
     }
 
-    /// Decrement the usable-defender count of an argument
+    /// Decrement `arg`'s usable-defender count: one of its attackers is out
     pub fn decrement_usable_defenders(&mut self, arg: usize) {
         self.usable_defenders_count[arg] -= 1;
     }
 
-    /// Increment the usable-defender count of an argument
+    /// Increment `arg`'s usable-defender count: one of its attackers is no
+    /// longer out
     pub fn increment_usable_defenders(&mut self, arg: usize) {
         self.usable_defenders_count[arg] += 1;
     }

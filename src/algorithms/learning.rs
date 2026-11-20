@@ -392,15 +392,15 @@ mod tests {
         false
     }
 
-    // Explaining an only-defender assignment needs the other defenders'
-    // being out, not just that the attacker must be defeated. 1 attacks the
-    // query 0, so must be defeated by 2, 3 or 5. Deciding 4 (level 1) puts
-    // its attacker 3 out; deciding 6 (level 2) puts 5 out, forcing 2 in as
-    // 1's only defender left. 8 attacks 6, so 6 needs 8's only attacker 7,
-    // but 2 attacks 7: conflict. Resolving it back to the decision 6 runs
-    // through 2's reason, which is where 3 being out enters: the clause is
-    // "6 out or 3 in", asserting 6 out at level 1. Without 3 it would say
-    // 6 is never in, yet {0, 3, 6, 7, 9} is complete.
+    // Explaining an only-defender assignment needs the other possible
+    // defenders' being out, not just that the attacker must be defeated. 1
+    // attacks the query 0, so must be defeated by 2, 3 or 5. Deciding 4
+    // (level 1) puts its attacker 3 out; deciding 6 (level 2) puts 5 out,
+    // forcing 2 in as the only defender left against 1. 8 attacks 6, so 6
+    // needs 8's only attacker 7, but 2 attacks 7: conflict. Resolving it
+    // back to the decision 6 runs through 2's reason, which is where 3 being
+    // out enters: the clause is "6 out or 3 in", asserting 6 out at level 1.
+    // Without 3 it would say 6 is never in, yet {0, 3, 6, 7, 9} is complete.
     #[test]
     fn test_only_defender_explanation() {
         let mut af = AF::new(10);
