@@ -12,6 +12,9 @@ pub struct ClauseWork {
     pub visits: usize,
     /// Literals scanned while looking for a replacement watch
     pub literals_scanned: usize,
+    /// Attacks walked: for each propagated literal, its argument's
+    /// attackers and victims
+    pub attacks_walked: usize,
 }
 
 /// A learned clause: a disjunction of In/Out literals, and its literal

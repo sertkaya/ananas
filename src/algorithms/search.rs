@@ -21,6 +21,28 @@ use crate::algorithms::node::Node;
 use crate::algorithms::scc::topological_components;
 use crate::algorithms::stats::Stats;
 
+/// The order a stable search makes its decisions in. Complete semantics
+/// always uses the activity order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Order {
+    /// Most active first
+    Activity,
+    /// By strongly connected component in topological order, sources first
+    /// (with assumptions, their cone first), most active first within one
+    Topological,
+}
+
+/// What a search with a conflict budget came to
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// An extension containing the assumptions
+    Extension(HashSet<usize>),
+    /// Proof that there is none
+    NoExtension,
+    /// The budget ran out first; the search can be resumed
+    Unknown,
+}
+
 /// A conflict-driven search for extensions of one framework under one
 /// semantics
 pub struct Solver<'a> {
@@ -46,6 +68,10 @@ pub struct Solver<'a> {
     // belong to every extension, and go in with the first call's
     // assumptions at level 0.
     started: bool,
+    // A search that ran out of budget: its assumptions, and the result of
+    // the propagation it stopped after, which a call with the same
+    // assumptions takes up again
+    suspended: Option<(Vec<usize>, Result<(), Conflict>)>,
     // The number of conflicts at which the clause database is next reduced
     next_reduction: usize,
     // The number of conflicts at which the search next restarts, how many
@@ -141,15 +167,23 @@ const REDUCTION_GROWTH: usize = 300;
 const GLUE_LBD: usize = 2;
 
 impl<'a> Solver<'a> {
-    /// A solver for `af` under `semantics`. If `verbose`, it prints its
-    /// progress to stderr every thousand conflicts.
+    /// A solver for `af` under `semantics`, in the topological order under
+    /// stable semantics. If `verbose`, it prints its progress to stderr
+    /// every thousand conflicts.
     pub fn new(af: &'a AF, semantics: Semantics, verbose: bool) -> Solver<'a> {
+        Solver::with_order(af, semantics, verbose, Order::Topological)
+    }
+
+    /// A solver for `af` under `semantics`, deciding in `order` under
+    /// stable semantics; see `decide`
+    pub fn with_order(af: &'a AF, semantics: Semantics, verbose: bool, order: Order) -> Solver<'a> {
         // Equally active arguments come out of the heap as `decide`
         // prefers attackers of a target: fewest attackers first
         let mut activity = Activity::new(by_attacker_count(af, false));
-        let (components, stable_order) = match semantics {
-            Semantics::Complete => (Vec::new(), Vec::new()),
-            Semantics::Stable => {
+        let (components, stable_order) = match (semantics, order) {
+            (Semantics::Complete, _) => (Vec::new(), Vec::new()),
+            (Semantics::Stable, Order::Activity) => (Vec::new(), by_attacker_count(af, true)),
+            (Semantics::Stable, Order::Topological) => {
                 let components = topological_components(af);
                 activity.set_groups(components.clone());
                 let order = by_group(&by_attacker_count(af, true), &components);
@@ -169,6 +203,7 @@ impl<'a> Solver<'a> {
             stats: Stats::default(),
             verbose,
             started: false,
+            suspended: None,
             next_reduction: FIRST_REDUCTION,
             next_restart: RESTART_UNIT * luby(1),
             restarts: 0,
@@ -207,6 +242,21 @@ impl<'a> Solver<'a> {
         self.stats.clauses = self.node.clauses().live_count();
     }
 
+    /// Under the topological order, the share of the arguments in the
+    /// largest strongly connected component; 1 otherwise, as then there is
+    /// only one group
+    pub fn largest_component_share(&self) -> f64 {
+        let n = self.components.len();
+        if n == 0 {
+            return 1.0;
+        }
+        let mut size = vec![0usize; self.components.iter().max().map_or(0, |&c| c + 1)];
+        for &c in &self.components {
+            size[c] += 1;
+        }
+        size.into_iter().max().unwrap_or(0) as f64 / n as f64
+    }
+
     /// The diagnostics gathered so far
     pub fn stats(&self) -> &Stats {
         &self.stats
@@ -241,20 +291,44 @@ impl<'a> Solver<'a> {
     /// only known to hold for extensions containing those. Returns `None`
     /// if there is no such extension.
     pub fn solve(&mut self, assumptions: &[usize]) -> Option<HashSet<usize>> {
+        match self.solve_limited(assumptions, usize::MAX) {
+            Outcome::Extension(extension) => Some(extension),
+            Outcome::NoExtension => None,
+            Outcome::Unknown => unreachable!("an unlimited search does not run out"),
+        }
+    }
+
+    /// As `solve`, but stop at the first conflict after `budget` more units
+    /// of propagation work (see `Stats::work`): a measure of search time
+    /// that, unlike time, makes the same run every time, and unlike
+    /// conflicts, weighs alike searches whose conflicts cost differently.
+    /// The search is suspended where it stopped, after dealing with that
+    /// conflict: called again with the same assumptions it continues from
+    /// there, making exactly the decisions it would have made without the
+    /// budget. (Resuming with a restart instead changed the search enough
+    /// to double the work crusti_200_0.1_127_15 DC-ST needed.) Called with
+    /// other assumptions, it starts again from level 0, keeping its learned
+    /// clauses, activities and phases.
+    pub fn solve_limited(&mut self, assumptions: &[usize], budget: usize) -> Outcome {
         let af = self.af;
         let started_at = Instant::now();
-        self.backtrack(0);
-
-        let mut seeds = assumptions.to_vec();
-        if !self.started {
-            self.started = true;
-            seeds.extend((0..af.argument_count()).filter(|&a| af.attacker_count(a) == 0));
-            if self.node.semantics() == Semantics::Stable && !assumptions.is_empty() {
-                self.cone_first(assumptions);
+        let stop_at = self.stats.work.saturating_add(budget);
+        let mut result = match self.suspended.take() {
+            Some((suspended_on, result)) if suspended_on == assumptions => result,
+            _ => {
+                self.backtrack(0);
+                let mut seeds = assumptions.to_vec();
+                if !self.started {
+                    self.started = true;
+                    seeds.extend((0..af.argument_count()).filter(|&a| af.attacker_count(a) == 0));
+                    if !self.components.is_empty() && !assumptions.is_empty() {
+                        self.cone_first(assumptions);
+                    }
+                }
+                self.stats.propagations += 1;
+                pseudo_complete(seeds, &mut self.node, af)
             }
-        }
-        self.stats.propagations += 1;
-        let mut result = pseudo_complete(seeds, &mut self.node, af);
+        };
 
         loop {
             match result {
@@ -276,7 +350,7 @@ impl<'a> Solver<'a> {
                     if learned.literals.is_empty() {
                         // Contradictory at level 0: the assumptions
                         // themselves rule out every extension.
-                        return None;
+                        return Outcome::NoExtension;
                     }
                     // Back to where the clause has exactly one literal not
                     // yet false, and make that one true. A unit clause has
@@ -307,6 +381,10 @@ impl<'a> Solver<'a> {
                         assign_literal(first, Reason::Clause(idx), &mut self.node)
                             .and_then(|()| self.propagate())
                     };
+                    if self.stats.work >= stop_at {
+                        self.suspended = Some((assumptions.to_vec(), result));
+                        return Outcome::Unknown;
+                    }
                 }
                 Ok(()) => {
                     #[cfg(test)]
@@ -325,7 +403,7 @@ impl<'a> Solver<'a> {
                     let decision = self.decide();
                     self.stats.deciding += started.elapsed();
                     let Some(lit) = decision else {
-                        return Some(self.node.arguments());
+                        return Outcome::Extension(self.node.arguments());
                     };
                     self.stats.decisions += 1;
                     if let Lit::Out(_) = lit {
@@ -349,6 +427,7 @@ impl<'a> Solver<'a> {
         self.stats.propagating += started.elapsed();
         self.stats.clause_visits += work.visits;
         self.stats.clause_literals_scanned += work.literals_scanned;
+        self.stats.work += work.attacks_walked + work.visits + work.literals_scanned;
         result
     }
 
@@ -392,9 +471,10 @@ impl<'a> Solver<'a> {
     /// attacker of one of them in, a defender of the set against that
     /// target; see `choose_defender`.
     ///
-    /// Under stable semantics, the decisions go through the strongly
-    /// connected components in topological order, sources first, activity
-    /// choosing only within a component. An extension restricted to a
+    /// Under stable semantics in the topological order (`Order`), the
+    /// decisions go through the strongly connected components in
+    /// topological order, sources first, activity choosing only within a
+    /// component. An extension restricted to a
     /// source component is a stable extension of it, and fixes what the
     /// components below have to work with, so the search settles each
     /// component before its descendants, and a conflict below jumps back
@@ -405,9 +485,11 @@ impl<'a> Solver<'a> {
     /// all eight DC-ST and SE-ST queries, timeouts at 1200s before, now in
     /// 54-143s. But crusti_200_0.1_127_15, DC-ST and SE-ST, both NO, went
     /// from 211s and 292s to timeouts at 600s: refuting a local
-    /// contradiction wants activity to home in on it. Complete semantics,
-    /// where activity already follows the query, keeps the activity order:
-    /// the topological one made DC-CO several times slower.)
+    /// contradiction wants activity to home in on it, which is why the
+    /// stable problems run both orders as a portfolio; see `stable.rs`.
+    /// Complete semantics, where activity already follows the query, keeps
+    /// the activity order: the topological one made DC-CO several times
+    /// slower.)
     ///
     /// Under stable semantics, once no target is left, an argument that is
     /// still undecided has to be either in or attacked. The choice is the
@@ -739,6 +821,59 @@ mod tests {
         }
         assert!(out_decisions > 500, "too few decisions put an argument out ({out_decisions})");
         assert!(answers[0] > 100 && answers[1] > 50, "answers too one-sided: {answers:?}");
+    }
+
+    // A search given a little work at a time, resumed every time it runs
+    // out, is the same search as in one go: it answers the same, after
+    // exactly as many decisions and conflicts, as resuming continues where
+    // it was suspended. Both semantics, both stable orders, on frameworks
+    // dense enough to conflict a lot.
+    #[test]
+    fn test_budgeted_search_keeps_answers() {
+        let mut rng = Rng::new(14);
+        let mut unknowns = 0;
+        let mut answers = [0, 0];
+        for round in 0..80 {
+            let n = 60 + rng.below(61);
+            let percent = [10, 15][rng.below(2)];
+            let af = random_af(&mut rng, n, percent);
+            let query = rng.below(n);
+            for (semantics, order) in [
+                (Semantics::Complete, Order::Activity),
+                (Semantics::Stable, Order::Activity),
+                (Semantics::Stable, Order::Topological),
+            ] {
+                let mut reference = Solver::with_order(&af, semantics, false, order);
+                let expected = reference.solve(&[query]);
+                let mut budgeted = Solver::with_order(&af, semantics, false, order);
+                let answer = loop {
+                    match budgeted.solve_limited(&[query], 1 + rng.below(3)) {
+                        Outcome::Unknown => unknowns += 1,
+                        Outcome::Extension(extension) => break Some(extension),
+                        Outcome::NoExtension => break None,
+                    }
+                };
+                assert_eq!(answer, expected,
+                    "round {round}, {semantics:?}, {order:?}, query {query}: {answer:?} vs {expected:?}\n{af}");
+                assert_eq!(
+                    (budgeted.stats().decisions, budgeted.stats().conflicts),
+                    (reference.stats().decisions, reference.stats().conflicts),
+                    "round {round}, {semantics:?}, {order:?}: a different search\n{af}"
+                );
+                if let Some(extension) = &answer {
+                    let valid = match semantics {
+                        Semantics::Complete => af.is_complete(extension),
+                        Semantics::Stable => af.is_stable(extension),
+                    };
+                    assert!(valid && extension.contains(&query), "round {round}: {extension:?}\n{af}");
+                    answers[0] += 1;
+                } else {
+                    answers[1] += 1;
+                }
+            }
+        }
+        assert!(unknowns > 1000, "budgets too rarely ran out ({unknowns})");
+        assert!(answers[0] >= 5 && answers[1] > 50, "answers too one-sided: {answers:?}");
     }
 
     // Deleting learned clauses and restarting change what the search does,

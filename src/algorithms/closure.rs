@@ -162,6 +162,7 @@ pub fn propagate(node: &mut Node, af: &AF) -> Result<(), Conflict> {
 /// `propagate`, adding what the learned clauses cost to `work`
 pub fn propagate_counting(node: &mut Node, af: &AF, work: &mut ClauseWork) -> Result<(), Conflict> {
     while let Some(lit) = node.next_to_propagate() {
+        work.attacks_walked += af.attacker_count(lit.arg()) + af.victims(lit.arg()).len();
         apply(lit, node, af);
         match lit {
             Lit::In(m) => {
