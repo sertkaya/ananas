@@ -50,15 +50,15 @@ fn set_out(arg: usize, reason: Reason, node: &mut Node) -> Result<(), Conflict> 
 ///
 /// The usable-defender count is decremented as out arguments are
 /// propagated, so it can lag behind the assignment and only ever
-/// overestimates. The cheap count settles the common case; below 2 the
-/// defenders are checked exactly against the assignment.
+/// overestimates. The cheap count settles the common case; below 2 `b`'s
+/// attackers are checked exactly against the assignment.
 ///
 /// Fails if the branch is dead.
 fn resolve_defenders(b: usize, node: &mut Node, af: &AF) -> Result<(), Conflict> {
     if !node.known_defeated(b) || node.usable_defenders_count(b) > 1 {
         // Either nothing demands that `b` be defeated, or there is still a
-        // choice of defenders: a flag and an array read, and nothing is
-        // forced or settled.
+        // choice of defenders against it: a flag and an array read, and
+        // nothing is forced or settled.
         return Ok(());
     }
     if node.is_defeated(af, b) {
@@ -138,9 +138,9 @@ fn unapply(lit: Lit, node: &mut Node, af: &AF) {
 /// defended in every completion and is put in, whether or not it is
 /// defended *yet* -- and since both routes feed the same counter, an
 /// argument whose attackers are covered by a mixture of them is put in too.
-/// Each argument that must be defeated also needs a usable defender: with
-/// one left it is put in (the P-pseudo-complete rule of Section 4.2), with
-/// none the branch is dead.
+/// Each argument that must be defeated also needs a usable attacker, a
+/// defender against it: with one left, that one is put in (the
+/// P-pseudo-complete rule of Section 4.2), with none the branch is dead.
 ///
 /// Learned clauses are propagated alongside: an argument's being decided
 /// falsifies one literal about it, and any clause watching that literal is
@@ -289,7 +289,7 @@ mod tests {
 
             // Fixpoint: conflict-free, closed under the completeness rule,
             // and every argument that must be defeated either is or still
-            // has a choice of defenders.
+            // has a choice of defenders against it.
             if node.contains(a) {
                 assert!(!node.is_defeated(af, a), "{a} is in and attacked by the set");
             }
@@ -298,7 +298,7 @@ mod tests {
             }
             if node.known_defeated(a) && !node.is_defeated(af, a) {
                 let usable = af.attackers(a).filter(|&&c| !node.is_out(c)).count();
-                assert!(usable >= 2, "{a} has {usable} usable defenders but was not resolved");
+                assert!(usable >= 2, "{a} has {usable} usable attackers but was not resolved");
             }
         }
     }
@@ -514,7 +514,7 @@ mod tests {
     // 5 and 6 attack 3 and each other. They keep 3 from being unattacked --
     // an unattacked attacker of the set could never be defeated, so the
     // branch would be dead and there would be no pseudo-complete superset
-    // at all -- while leaving 3 two possible defenders, so neither the
+    // at all -- while leaving two possible defenders against 3, so neither the
     // single-defender rule nor the no-defender check resolves it first.
     #[test]
     fn test_pseudo_complete_quasi_complete() {
@@ -561,8 +561,9 @@ mod tests {
     // containing 0 must attack it back (quasi-complete). Neither rule alone
     // covers all of 3's attackers, so tracking the routes in separate
     // counters leaves 3 unforced; sharing one counter forces it. 4 and 5
-    // mutually attack and both attack 2, so 2 has two possible defenders
-    // and the single-defender rule cannot resolve it instead.
+    // mutually attack and both attack 2, so there are two possible
+    // defenders against 2 and the single-defender rule cannot resolve it
+    // instead.
     #[test]
     fn test_pseudo_complete_mixed_defeat_routes() {
         let mut af = AF::new(6);
@@ -587,9 +588,10 @@ mod tests {
     }
 
     // Single-defender chain (paper Section 4.2 / Figure 3): forcing 0 in
-    // leaves its attacker 1 undefeated; 1's only possible defender is 2, so
-    // 2 must be forced in too, with no branching. That in turn leaves 2's
-    // attacker 3 undefeated; 3's only possible defender is 4, so 4 gets
+    // leaves its attacker 1 undefeated; the only possible defender against
+    // 1 is 2, so 2 must be forced in too, with no branching. That in turn
+    // leaves 2's attacker 3 undefeated; the only possible defender against 3
+    // is 4, so 4 gets
     // forced in as well -- a two-link forced chain resolved within this one
     // pseudo_complete call, yielding a complete extension directly.
     #[test]
@@ -604,8 +606,8 @@ mod tests {
         assert!(pseudo_complete(vec![0], &mut node, &af).is_ok());
 
         println!("{}", node);
-        assert!(node.contains(2), "2 is 1's only possible defender");
-        assert!(node.contains(4), "4 is 3's only possible defender");
+        assert!(node.contains(2), "2 is the only possible defender against 1");
+        assert!(node.contains(4), "4 is the only possible defender against 3");
         assert!(node.is_self_defending(&af));
     }
 }
